@@ -1,0 +1,90 @@
+[tool.poetry]
+name = "trading-bot"
+version = "0.1.0"
+description = "AI-powered Binance BTCUSDT trading bot with paper trading, web dashboard, and Telegram notifications"
+authors = ["Sebastian"]
+readme = "README.md"
+packages = [
+    { include = "packages" },
+    { include = "apps" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.11"
+# Exchange
+python-binance = "^1.0.19"
+# Data & Analysis
+pandas = "^2.2.0"
+numpy = "^2.0.0"
+ta = "^0.11.0"
+# Database
+sqlalchemy = "^2.0.0"
+aiosqlite = "^0.19.0"
+# API
+fastapi = "^0.109.0"
+uvicorn = {extras = ["standard"], version = "^0.27.0"}
+pydantic = "^2.6.0"
+pydantic-settings = "^2.1.0"
+# AI/ML
+torch = "^2.2.0"
+stable-baselines3 = "^2.2.0"
+gymnasium = "^0.29.0"
+# Notifications
+python-telegram-bot = "^20.7"
+# Async
+aiohttp = "^3.9.0"
+websockets = "^12.0"
+# Utils
+python-dotenv = "^1.0.0"
+loguru = "^0.7.0"
+httpx = "^0.26.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.0.0"
+pytest-asyncio = "^0.23.0"
+pytest-cov = "^4.1.0"
+ruff = "^0.2.0"
+mypy = "^1.8.0"
+bandit = "^1.7.0"
+pip-audit = "^2.7.0"
+pre-commit = "^3.6.0"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "ARG", # flake8-unused-arguments
+    "SIM", # flake8-simplify
+]
+ignore = ["E501", "B008", "B904"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+skips = ["B101"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
