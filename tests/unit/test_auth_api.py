@@ -39,14 +39,16 @@ def _login(client: TestClient, username: str, password: str) -> str:
     return response.json()["access_token"]
 
 
-def test_protected_endpoint_requires_token_when_enabled(auth_enabled):
+@pytest.mark.usefixtures("auth_enabled")
+def test_protected_endpoint_requires_token_when_enabled():
     """Protected endpoints reject unauthenticated requests."""
     client = TestClient(app)
     response = client.get("/api/system/state")
     assert response.status_code == 401
 
 
-def test_login_and_me_flow(auth_enabled):
+@pytest.mark.usefixtures("auth_enabled")
+def test_login_and_me_flow():
     """Login returns a token that can access /me."""
     client = TestClient(app)
     token = _login(client, "admin", "admin-pass")
@@ -58,7 +60,8 @@ def test_login_and_me_flow(auth_enabled):
     assert data["role"] == "admin"
 
 
-def test_viewer_cannot_perform_operator_action(auth_enabled):
+@pytest.mark.usefixtures("auth_enabled")
+def test_viewer_cannot_perform_operator_action():
     """Viewer role cannot call operator-level endpoints."""
     client = TestClient(app)
     token = _login(client, "viewer", "viewer-pass")
@@ -70,7 +73,8 @@ def test_viewer_cannot_perform_operator_action(auth_enabled):
     assert response.status_code == 403
 
 
-def test_operator_cannot_perform_admin_action(auth_enabled):
+@pytest.mark.usefixtures("auth_enabled")
+def test_operator_cannot_perform_admin_action():
     """Operator role cannot call admin-only live order endpoint."""
     client = TestClient(app)
     token = _login(client, "operator", "operator-pass")
@@ -87,4 +91,3 @@ def test_operator_cannot_perform_admin_action(auth_enabled):
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 403
-

@@ -59,6 +59,33 @@ async def test_advisor_generates_drawdown_proposal(db_session: AsyncSession) -> 
 
 
 @pytest.mark.asyncio
+async def test_advisor_generates_grid_tuning_for_smart_grid(db_session: AsyncSession) -> None:
+    db_session.add(
+        MetricsSnapshot(
+            strategy_name="smart_grid_ai",
+            total_trades=80,
+            winning_trades=25,
+            losing_trades=55,
+            total_pnl=Decimal("-80"),
+            total_fees=Decimal("35"),
+            max_drawdown=0.05,
+            sharpe_ratio=-0.1,
+            sortino_ratio=-0.2,
+            profit_factor=0.9,
+            win_rate=0.31,
+            avg_trade_pnl=Decimal("-1.1"),
+            is_paper=True,
+        )
+    )
+    await db_session.flush()
+
+    advisor = AIAdvisor()
+    proposals = await advisor.generate_proposals(db_session)
+
+    assert any(p.proposal_type == "grid_tuning" for p in proposals)
+
+
+@pytest.mark.asyncio
 async def test_approval_gate_approve_applies_config_diff(db_session: AsyncSession) -> None:
     gate = ApprovalGate()
     db_session.add(Config(version=1, data={"risk": {"per_trade": 0.005}}, active=True))

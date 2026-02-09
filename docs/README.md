@@ -13,6 +13,7 @@ This folder contains the full project documentation.
 - [Postman Collection](./postman/Trading-Bot.postman_collection.json)
 - [Postman Local Environment](./postman/Trading-Bot.local.postman_environment.json)
 - [Code Reference](./CODE_REFERENCE.md)
+- [Secrets Management Guide](./SECRETS_MANAGEMENT.md)
 - [Onboarding Checklist](./ONBOARDING_CHECKLIST.md)
 - [Operator Quickstart](./OPERATOR_QUICKSTART.md)
 - [Operations Runbook](./OPERATIONS_RUNBOOK.md)
@@ -27,6 +28,7 @@ This folder contains the full project documentation.
 6. API Examples
 7. Postman Collection + Environment
 8. Code Reference
-9. Onboarding Checklist
-10. Operator Quickstart
-11. Operations Runbook
+9. Secrets Management Guide
+10. Onboarding Checklist
+11. Operator Quickstart
+12. Operations Runbook

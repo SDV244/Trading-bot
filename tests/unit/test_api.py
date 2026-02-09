@@ -3,11 +3,13 @@ Tests for API endpoints.
 """
 
 import asyncio
+from unittest.mock import AsyncMock, patch
 
 from fastapi.testclient import TestClient
 
 from apps.api.main import app
 from packages.core.config import reload_settings
+from packages.core.trading_cycle import DataReadiness, TimeframeReadiness
 
 
 class TestHealthEndpoints:
@@ -102,19 +104,102 @@ class TestSystemEndpoints:
 
     def test_scheduler_endpoints(self):
         """Scheduler status/start/stop endpoints work."""
+        import packages.core.config as config_module
+
+        config_module._settings = None
         client = TestClient(app)
 
         status = client.get("/api/system/scheduler")
         assert status.status_code == 200
         assert "running" in status.json()
 
-        started = client.post("/api/system/scheduler/start?interval_seconds=5")
+        # Disable readiness gate for this smoke test.
+        with patch.dict("os.environ", {"TRADING_REQUIRE_DATA_READY": "false"}):
+            reload_settings()
+            started = client.post("/api/system/scheduler/start?interval_seconds=5")
         assert started.status_code == 200
         assert started.json()["running"] is True
 
         stopped = client.post("/api/system/scheduler/stop")
         assert stopped.status_code == 200
         assert stopped.json()["running"] is False
+
+    def test_scheduler_start_returns_409_when_data_not_ready(self):
+        """Scheduler start is blocked when warmup data is missing."""
+        client = TestClient(app)
+
+        mock_readiness = DataReadiness(
+            symbol="BTCUSDT",
+            active_strategy="trend_ema",
+            require_data_ready=True,
+            data_ready=False,
+            reasons=["4h: requires 50 candles, found 12"],
+            timeframes={
+                "1h": TimeframeReadiness(required=20, available=120, ready=True),
+                "4h": TimeframeReadiness(required=50, available=12, ready=False),
+            },
+        )
+
+        with patch.dict("os.environ", {"TRADING_REQUIRE_DATA_READY": "true"}):
+            reload_settings()
+            with patch("apps.api.routers.system.get_trading_cycle_service") as mock_service_getter, \
+                 patch("apps.api.routers.system.get_session") as mock_session_getter:
+                mock_service = AsyncMock()
+                mock_service.get_data_readiness.return_value = mock_readiness
+                mock_service_getter.return_value = mock_service
+                mock_session = AsyncMock()
+                mock_session_getter.return_value.__aenter__.return_value = mock_session
+
+                response = client.post("/api/system/scheduler/start?interval_seconds=5")
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert detail["data_ready"] is False
+        assert detail["active_strategy"] == "trend_ema"
+        assert detail["timeframes"]["4h"]["ready"] is False
+
+    def test_get_system_readiness(self):
+        """System readiness endpoint returns data readiness details."""
+        client = TestClient(app)
+        response = client.get("/api/system/readiness")
+        assert response.status_code == 200
+        data = response.json()
+        assert "ready" in data
+        assert "data_ready" in data
+        assert "timeframes" in data
+
+    def test_get_notification_status(self):
+        """Notification status endpoint returns safe config booleans."""
+        client = TestClient(app)
+        mock_notifier = AsyncMock()
+        mock_notifier.enabled = True
+        mock_notifier.bot_token = "token_present"
+        mock_notifier.chat_id = "chat_present"
+        with patch("apps.api.routers.system.get_telegram_notifier", return_value=mock_notifier):
+            response = client.get("/api/system/notifications/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["enabled"] is True
+        assert data["has_bot_token"] is True
+        assert data["has_chat_id"] is True
+
+    def test_send_test_notification(self):
+        """Test notification endpoint triggers notifier send."""
+        client = TestClient(app)
+        mock_notifier = AsyncMock()
+        mock_notifier.enabled = True
+        mock_notifier.bot_token = "token_present"
+        mock_notifier.chat_id = "chat_present"
+        mock_notifier.send_info = AsyncMock(return_value=True)
+        with patch("apps.api.routers.system.get_telegram_notifier", return_value=mock_notifier):
+            response = client.post(
+                "/api/system/notifications/test",
+                json={"title": "API Test", "body": "hello"},
+            )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["delivered"] is True
+        mock_notifier.send_info.assert_awaited_once()
 
 
 class TestTradingEndpoints:
@@ -123,6 +208,16 @@ class TestTradingEndpoints:
     def test_get_config(self, monkeypatch):
         """Can get trading configuration."""
         monkeypatch.setenv("TRADING_LIVE_MODE", "false")
+        monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+        monkeypatch.setenv("TRADING_SPOT_POSITION_MODE", "long_flat")
+        monkeypatch.setenv("TRADING_PAPER_STARTING_EQUITY", "10000")
+        monkeypatch.setenv("TRADING_ADVISOR_INTERVAL_CYCLES", "30")
+        monkeypatch.setenv("TRADING_GRID_LEVELS", "6")
+        monkeypatch.setenv("TRADING_GRID_MIN_SPACING_BPS", "25")
+        monkeypatch.setenv("TRADING_GRID_MAX_SPACING_BPS", "220")
+        monkeypatch.setenv("TRADING_GRID_ENFORCE_FEE_FLOOR", "false")
+        monkeypatch.setenv("TRADING_GRID_MIN_NET_PROFIT_BPS", "30")
+        monkeypatch.setenv("TRADING_GRID_COOLDOWN_SECONDS", "0")
         reload_settings()
         client = TestClient(app)
         response = client.get("/api/trading/config")
@@ -131,6 +226,19 @@ class TestTradingEndpoints:
         assert data["trading_pair"] == "BTCUSDT"
         assert "1h" in data["timeframes"]
         assert data["live_mode"] is False
+        assert data["active_strategy"] == "smart_grid_ai"
+        assert data["require_data_ready"] is True
+        assert data["spot_position_mode"] == "long_flat"
+        assert data["paper_starting_equity"] == 10000.0
+        assert "smart_grid_ai" in data["supported_strategies"]
+        assert data["advisor_interval_cycles"] == 30
+        assert data["grid_lookback_1h"] == 120
+        assert data["grid_atr_period_1h"] == 14
+        assert data["grid_levels"] == 6
+        assert data["grid_spacing_mode"] == "geometric"
+        assert data["grid_auto_inventory_bootstrap"] is True
+        assert data["grid_enforce_fee_floor"] is False
+        assert data["grid_min_net_profit_bps"] == 30
 
     def test_get_position(self):
         """Can get current position."""

@@ -21,6 +21,7 @@ Production-oriented local trading platform with strict safety controls:
 - Postman collection: `docs/postman/Trading-Bot.postman_collection.json`
 - Postman local environment: `docs/postman/Trading-Bot.local.postman_environment.json`
 - Code reference: `docs/CODE_REFERENCE.md`
+- Secrets management: `docs/SECRETS_MANAGEMENT.md`
 - Onboarding checklist: `docs/ONBOARDING_CHECKLIST.md`
 - Operator quickstart: `docs/OPERATOR_QUICKSTART.md`
 - Operations runbook: `docs/OPERATIONS_RUNBOOK.md`
@@ -98,9 +99,15 @@ copy .env.example .env
 
 Set required values in `.env`:
 
-- `BINANCE_API_KEY`
-- `BINANCE_API_SECRET`
-- `BINANCE_TESTNET=true` (recommended for local)
+- `BINANCE_TESTNET=false` (recommended for paper mode with stable history)
+- `BINANCE_MARKET_DATA_BASE_URL=https://data-api.binance.vision`
+- `TRADING_ACTIVE_STRATEGY=trend_ema`
+- `TRADING_REQUIRE_DATA_READY=true`
+- `TRADING_SPOT_POSITION_MODE=long_flat`
+- `TRADING_PAPER_STARTING_EQUITY=10000`
+- optional tuned profile: `TRADING_ACTIVE_STRATEGY=trend_ema_fast`
+- use `APP_SECRETS_DIR` for credentials (file-per-secret)
+- `BINANCE_API_KEY` and `BINANCE_API_SECRET` are only required for live/signed flows
 - optional Telegram:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_CHAT_ID`
@@ -160,6 +167,7 @@ poetry run alembic upgrade head
 System:
 
 - `GET /api/system/state`
+- `GET /api/system/readiness`
 - `POST /api/system/state`
 - `POST /api/system/emergency-stop`
 - `GET /api/system/scheduler`
@@ -213,3 +221,6 @@ Production images are built/published by `.github/workflows/cd.yml` on `main`.
 - Alembic migrations run at startup when `DB_AUTO_MIGRATE=true`.
 - Scheduler executes in-process with API.
 - Current release is paper-trading only; live engine is intentionally gated for future release.
+- Scheduler start returns `409` when `TRADING_REQUIRE_DATA_READY=true` and warmup candles are missing.
+- Paper risk sizing uses `TRADING_PAPER_STARTING_EQUITY`; if you seed a position larger than max exposure (`RISK_MAX_EXPOSURE * equity`), the cycle will correctly return `max_exposure_reached`.
+- `TRADING_SPOT_POSITION_MODE=long_flat` prevents repeated BUY adds and uses SELL as exit when already long.

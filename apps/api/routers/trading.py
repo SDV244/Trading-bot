@@ -82,7 +82,29 @@ class ConfigResponse(BaseModel):
 
     trading_pair: str
     timeframes: list[str]
+    supported_strategies: list[str]
     live_mode: bool
+    active_strategy: str
+    require_data_ready: bool
+    spot_position_mode: str
+    paper_starting_equity: float
+    advisor_interval_cycles: int
+    grid_lookback_1h: int
+    grid_atr_period_1h: int
+    grid_levels: int
+    grid_spacing_mode: str
+    grid_min_spacing_bps: int
+    grid_max_spacing_bps: int
+    grid_trend_tilt: float
+    grid_volatility_blend: float
+    grid_take_profit_buffer: float
+    grid_stop_loss_buffer: float
+    grid_cooldown_seconds: int
+    grid_auto_inventory_bootstrap: bool
+    grid_bootstrap_fraction: float
+    grid_enforce_fee_floor: bool
+    grid_min_net_profit_bps: int
+    grid_out_of_bounds_alert_cooldown_minutes: int
     risk_per_trade: float
     max_daily_loss: float
     max_exposure: float
@@ -140,12 +162,35 @@ async def get_trading_config(
 ) -> ConfigResponse:
     """Get current trading configuration."""
     from packages.core.config import get_settings
+    from packages.core.strategies import registry
 
     settings = get_settings()
     return ConfigResponse(
         trading_pair=settings.trading.pair,
         timeframes=settings.trading.timeframe_list,
+        supported_strategies=registry.list_names(),
         live_mode=settings.trading.live_mode,
+        active_strategy=settings.trading.active_strategy,
+        require_data_ready=settings.trading.require_data_ready,
+        spot_position_mode=settings.trading.spot_position_mode,
+        paper_starting_equity=settings.trading.paper_starting_equity,
+        advisor_interval_cycles=settings.trading.advisor_interval_cycles,
+        grid_lookback_1h=settings.trading.grid_lookback_1h,
+        grid_atr_period_1h=settings.trading.grid_atr_period_1h,
+        grid_levels=settings.trading.grid_levels,
+        grid_spacing_mode=settings.trading.grid_spacing_mode,
+        grid_min_spacing_bps=settings.trading.grid_min_spacing_bps,
+        grid_max_spacing_bps=settings.trading.grid_max_spacing_bps,
+        grid_trend_tilt=settings.trading.grid_trend_tilt,
+        grid_volatility_blend=settings.trading.grid_volatility_blend,
+        grid_take_profit_buffer=settings.trading.grid_take_profit_buffer,
+        grid_stop_loss_buffer=settings.trading.grid_stop_loss_buffer,
+        grid_cooldown_seconds=settings.trading.grid_cooldown_seconds,
+        grid_auto_inventory_bootstrap=settings.trading.grid_auto_inventory_bootstrap,
+        grid_bootstrap_fraction=settings.trading.grid_bootstrap_fraction,
+        grid_enforce_fee_floor=settings.trading.grid_enforce_fee_floor,
+        grid_min_net_profit_bps=settings.trading.grid_min_net_profit_bps,
+        grid_out_of_bounds_alert_cooldown_minutes=settings.trading.grid_out_of_bounds_alert_cooldown_minutes,
         risk_per_trade=settings.risk.per_trade,
         max_daily_loss=settings.risk.max_daily_loss,
         max_exposure=settings.risk.max_exposure,

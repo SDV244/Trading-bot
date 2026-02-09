@@ -28,9 +28,9 @@ This is a practical map of where logic lives and what to edit for each change.
 - `apps/api/routers/auth.py`
   - login and current-user endpoints
 - `apps/api/routers/system.py`
-  - state machine + scheduler control endpoints
+  - state machine + scheduler control + system readiness endpoint
 - `apps/api/routers/market.py`
-  - market/candle/data-fetch endpoints
+  - market/candle/data-fetch + data-requirements endpoints
 - `apps/api/routers/trading.py`
   - config/position/orders/fills/metrics/paper cycle/live order endpoints
 - `apps/api/routers/ai.py`
@@ -47,13 +47,16 @@ This is a practical map of where logic lives and what to edit for each change.
 ## Backend: Core Domain
 
 - `packages/core/config.py`
-  - all environment-driven settings (including auth + CORS list)
+  - all environment-driven settings (including strategy selection, data readiness gate, paper starting equity)
+  - file-based secrets via `APP_SECRETS_DIR`
 - `packages/core/state.py`
   - system state machine and transition rules
 - `packages/core/scheduler.py`
   - periodic cycle execution and status tracking
 - `packages/core/trading_cycle.py`
   - orchestration of strategy -> risk -> execution -> persistence
+  - active strategy instantiation from registry
+  - strategy candle requirements + readiness checks
 - `packages/core/data_fetcher.py`
   - batch candle fetching and storage
 - `packages/core/audit.py`
@@ -67,6 +70,7 @@ This is a practical map of where logic lives and what to edit for each change.
 - `packages/core/strategies/trend.py`
 - `packages/core/strategies/mean_reversion.py`
 - `packages/core/strategies/breakout.py`
+- `packages/core/strategies/smart_grid.py` (adaptive grid with regime tilt + volatility spacing)
 
 ### Risk + Execution + Metrics
 
@@ -126,4 +130,3 @@ This is a practical map of where logic lives and what to edit for each change.
   - page component in `apps/web/src/pages`
   - route in `apps/web/src/App.tsx`
   - API methods in `apps/web/src/api.ts`
-

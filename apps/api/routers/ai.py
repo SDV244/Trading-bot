@@ -1,18 +1,20 @@
 """AI approval and audit endpoints."""
 
 from datetime import datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from apps.api.security.auth import AuthUser, require_min_role
+from packages.core.ai import ApprovalGateError, get_ai_advisor, get_approval_gate
 from packages.core.config import AuthRole
-
-from packages.core.ai import ApprovalGateError, DRLOptimizer, get_ai_advisor, get_approval_gate
 from packages.core.database.models import Approval, EquitySnapshot, EventLog
 from packages.core.database.session import get_session, init_database
+
+if TYPE_CHECKING:
+    from packages.core.ai.drl_optimizer import DRLOptimizer
 
 router = APIRouter()
 
@@ -229,10 +231,12 @@ async def list_events(
     ]
 
 
-_optimizer: DRLOptimizer | None = None
+_optimizer: "DRLOptimizer | None" = None
 
 
-def _get_optimizer() -> DRLOptimizer:
+def _get_optimizer() -> "DRLOptimizer":
+    from packages.core.ai.drl_optimizer import DRLOptimizer
+
     global _optimizer
     if _optimizer is None:
         _optimizer = DRLOptimizer()

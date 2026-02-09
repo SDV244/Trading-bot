@@ -52,11 +52,13 @@ class PaperEngine:
         slippage_bps: int = 5,
         min_notional: Decimal = Decimal("10"),
         lot_step_size: Decimal = Decimal("0.00001"),
+        allowed_symbols: set[str] | None = None,
     ) -> None:
         self.fee_bps = fee_bps
         self.slippage_bps = slippage_bps
         self.min_notional = min_notional
         self.lot_step_size = lot_step_size
+        self.allowed_symbols = allowed_symbols
 
     def execute_market_order(self, order: OrderRequest, last_price: Decimal) -> PaperFill:
         """Execute a simulated market order with configurable slippage."""
@@ -178,8 +180,8 @@ class PaperEngine:
         return (notional * Decimal(self.fee_bps) / Decimal("10000")).quantize(Decimal("0.00000001"))
 
     def _validate_order(self, order: OrderRequest) -> None:
-        if order.symbol != "BTCUSDT":
-            msg = "Only BTCUSDT is supported in v1"
+        if self.allowed_symbols is not None and order.symbol not in self.allowed_symbols:
+            msg = f"Symbol {order.symbol} is not allowed in this paper engine instance"
             raise PaperExecutionError(msg)
         if order.quantity <= 0:
             msg = "quantity must be positive"

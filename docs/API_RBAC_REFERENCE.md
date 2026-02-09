@@ -39,11 +39,12 @@ Auth requirement:
 ## System
 
 - `GET /api/system/state` (`viewer+`)
+- `GET /api/system/readiness` (`viewer+`)
 - `POST /api/system/state` (`operator+`)
 - `POST /api/system/emergency-stop` (`operator+`)
 - `GET /api/system/state/history` (`viewer+`)
 - `GET /api/system/scheduler` (`viewer+`)
-- `POST /api/system/scheduler/start` (`operator+`)
+- `POST /api/system/scheduler/start` (`operator+`, returns `409` if warmup data is missing and `TRADING_REQUIRE_DATA_READY=true`)
 - `POST /api/system/scheduler/stop` (`operator+`)
 
 ## Market
@@ -51,6 +52,7 @@ Auth requirement:
 - `GET /api/market/price` (`viewer+`)
 - `GET /api/market/candles` (`viewer+`)
 - `GET /api/market/data/status` (`viewer+`)
+- `GET /api/market/data/requirements` (`viewer+`)
 - `POST /api/market/data/fetch` (`operator+`)
 
 ## Trading
@@ -96,4 +98,3 @@ API responses include hardened defaults:
 - `Content-Security-Policy`
 - `Referrer-Policy`
 - `Permissions-Policy`
-

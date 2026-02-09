@@ -8,6 +8,7 @@ Includes klines fetching, retry logic, and rate limit handling.
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
+import time
 from typing import Any, cast
 
 import httpx
@@ -50,16 +51,20 @@ class BinanceSpotAdapter:
 
     # Rate limit tracking
     MAX_REQUESTS_PER_MINUTE = 1200
-    KLINES_WEIGHT = 1  # Weight for klines endpoint
+    KLINES_WEIGHT = 2  # Weight for /api/v3/klines endpoint
 
     def __init__(self) -> None:
         """Initialize the Binance adapter."""
         settings = get_settings()
-        self.base_url = settings.binance.base_url
+        self.base_url = settings.binance.public_market_data_url
         self.testnet = settings.binance.testnet
         self._client: httpx.AsyncClient | None = None
         self._request_count = 0
         self._last_reset = datetime.now(UTC)
+        self._request_lock = asyncio.Lock()
+        self._last_request_ts = 0.0
+        self._max_retries = max(1, settings.binance.market_max_retries)
+        self._min_interval_ms = max(0, settings.binance.market_min_interval_ms)
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the HTTP client."""
@@ -105,6 +110,7 @@ class BinanceSpotAdapter:
 
         for attempt in range(max_retries):
             try:
+                await self._throttle()
                 # Check rate limit
                 await self._check_rate_limit(weight)
 
@@ -165,6 +171,18 @@ class BinanceSpotAdapter:
 
         self._request_count += weight
 
+    async def _throttle(self) -> None:
+        """Enforce minimum time between public requests."""
+        interval_seconds = self._min_interval_ms / 1000
+        if interval_seconds <= 0:
+            return
+        async with self._request_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_ts
+            if elapsed < interval_seconds:
+                await asyncio.sleep(interval_seconds - elapsed)
+            self._last_request_ts = time.monotonic()
+
     def _update_rate_limit(self, response: httpx.Response) -> None:
         """Update rate limit tracking from response headers."""
         used = response.headers.get("X-MBX-USED-WEIGHT-1M")
@@ -173,7 +191,7 @@ class BinanceSpotAdapter:
 
     async def get_server_time(self) -> datetime:
         """Get Binance server time."""
-        data = await self._request_with_retry("GET", "/api/v3/time")
+        data = await self._request_with_retry("GET", "/api/v3/time", max_retries=self._max_retries)
         if not isinstance(data, dict):
             raise ValueError("Invalid server time response")
         server_time = data.get("serverTime")
@@ -195,6 +213,7 @@ class BinanceSpotAdapter:
             "GET",
             "/api/v3/ticker/price",
             params={"symbol": symbol},
+            max_retries=self._max_retries,
         )
         if not isinstance(data, dict):
             raise ValueError("Invalid ticker price response")
@@ -239,6 +258,7 @@ class BinanceSpotAdapter:
             "GET",
             "/api/v3/klines",
             params=params,
+            max_retries=self._max_retries,
             weight=self.KLINES_WEIGHT,
         )
         if not isinstance(data, list):
@@ -279,6 +299,7 @@ class BinanceSpotAdapter:
             "GET",
             "/api/v3/exchangeInfo",
             params={"symbol": symbol},
+            max_retries=self._max_retries,
             weight=10,
         )
         if not isinstance(data, dict):

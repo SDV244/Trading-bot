@@ -4,6 +4,9 @@ This is the fastest safe workflow for daily operations.
 
 ## 1) Start Services
 
+1. Ensure local secrets are present (`.secrets/`) and mounted via `APP_SECRETS_DIR`.
+2. Start stack:
+
 ```bash
 docker compose up --build -d
 docker compose ps
@@ -85,4 +88,3 @@ curl -s "http://127.0.0.1:8000/api/ai/approvals?status=PENDING" -H "Authorizatio
 1. Confirm no unresolved pending approvals.
 2. Confirm no active incident.
 3. Optionally archive logs/DB snapshot for audit retention.
-

@@ -4,6 +4,12 @@ This runbook covers common operational tasks and incident response actions.
 
 ## 1) Service Lifecycle
 
+Before startup:
+
+- verify `.secrets/` exists locally
+- verify `APP_SECRETS_DIR` points to that directory
+- never place real secrets in `.env.example` or committed files
+
 Start:
 
 ```bash
@@ -109,4 +115,3 @@ If approvals/actions fail with `403`:
 
 - role is insufficient for requested operation
 - verify assigned account role and token freshness
-

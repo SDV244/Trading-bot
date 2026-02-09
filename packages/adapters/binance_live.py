@@ -29,7 +29,7 @@ class BinanceLiveAdapter:
         self.settings = settings
         self.api_key = settings.binance.api_key
         self.api_secret = settings.binance.api_secret
-        self.base_url = settings.binance.base_url
+        self.base_url = settings.binance.trading_base_url
         self._client: httpx.AsyncClient | None = None
         self._request_lock = asyncio.Lock()
         self._last_request_ts = 0.0

@@ -49,6 +49,10 @@ class Strategy(ABC):
     def generate_signal(self, context: StrategyContext) -> Signal:
         """Generate a signal from the provided market context."""
 
+    def data_requirements(self) -> dict[str, int]:
+        """Minimum candles required per timeframe."""
+        return {}
+
 
 class StrategyRegistry:
     """Registry for strategy plugins."""

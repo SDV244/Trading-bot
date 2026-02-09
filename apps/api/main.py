@@ -32,6 +32,8 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info(f"Starting Trading Bot API on {settings.api.host}:{settings.api.port}")
     logger.info(f"Trading mode: {'LIVE' if settings.trading.live_mode else 'PAPER'}")
     logger.info(f"Trading pair: {settings.trading.pair}")
+    if settings.trading.live_mode and (not settings.binance.api_key or not settings.binance.api_secret):
+        raise RuntimeError("TRADING_LIVE_MODE=true requires BINANCE_API_KEY and BINANCE_API_SECRET")
 
     # Initialize database
     await init_database()

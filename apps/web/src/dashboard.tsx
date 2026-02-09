@@ -1,10 +1,28 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 
-import { api, type Approval, type AuditEvent, type EquityPoint, type Fill, type Metrics, type Order, type PaperCycleResult, type Position, type SchedulerStatus, type SystemState, type TradingConfig } from "./api";
+import {
+  api,
+  type Approval,
+  type AuditEvent,
+  type EquityPoint,
+  type Fill,
+  type MarketCandle,
+  type MarketPrice,
+  type Metrics,
+  type Order,
+  type PaperCycleResult,
+  type Position,
+  type SchedulerStatus,
+  type SystemReadiness,
+  type SystemState,
+  type TradingConfig,
+} from "./api";
 
 type DashboardData = {
   health: { status: string; timestamp: string; version: string } | null;
   ready: { ready: boolean; database: boolean; binance: boolean } | null;
+  lastUpdatedAt: string | null;
+  systemReadiness: SystemReadiness | null;
   system: SystemState | null;
   scheduler: SchedulerStatus | null;
   config: TradingConfig | null;
@@ -15,6 +33,8 @@ type DashboardData = {
   equity: EquityPoint[];
   approvals: Approval[];
   events: AuditEvent[];
+  marketCandles: MarketCandle[];
+  marketPrice: MarketPrice | null;
   lastCycle: PaperCycleResult | null;
 };
 
@@ -33,6 +53,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
   const [data, setData] = useState<DashboardData>({
     health: null,
     ready: null,
+    lastUpdatedAt: null,
+    systemReadiness: null,
     system: null,
     scheduler: null,
     config: null,
@@ -43,6 +65,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     equity: [],
     approvals: [],
     events: [],
+    marketCandles: [],
+    marketPrice: null,
     lastCycle: null,
   });
   const [loading, setLoading] = useState(true);
@@ -50,13 +74,15 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
 
   const refresh = useCallback(async () => {
     try {
-      const [health, ready, system, scheduler, config, position, metrics, orders, fills, equity, approvals, events] =
+      const config = await api.getTradingConfig();
+      const symbol = config.trading_pair;
+      const [health, ready, systemReadiness, system, scheduler, position, metrics, orders, fills, equity, approvals, events, marketCandles, marketPrice] =
         await Promise.all([
           api.health(),
           api.ready(),
+          api.getSystemReadiness(),
           api.getSystemState(),
           api.getScheduler(),
-          api.getTradingConfig(),
           api.getPosition(),
           api.getMetrics(),
           api.getOrders(8),
@@ -64,11 +90,15 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
           api.getEquityHistory(30),
           api.listApprovals(undefined, 50),
           api.listEvents({ limit: 20 }),
+          api.getMarketCandles(symbol, "1h", 120).catch(() => []),
+          api.getMarketPrice(symbol).catch(() => null),
         ]);
       setData((prev) => ({
         ...prev,
         health,
         ready,
+        lastUpdatedAt: new Date().toISOString(),
+        systemReadiness,
         system,
         scheduler,
         config,
@@ -79,6 +109,8 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         equity,
         approvals,
         events,
+        marketCandles,
+        marketPrice,
       }));
       setError(null);
     } catch (e) {
@@ -123,4 +155,3 @@ export function useDashboard() {
   }
   return context;
 }
-

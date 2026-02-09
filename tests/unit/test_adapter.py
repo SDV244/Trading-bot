@@ -4,6 +4,7 @@ Tests for Binance Spot Adapter.
 
 from datetime import datetime
 from decimal import Decimal
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -72,6 +73,25 @@ async def test_get_klines(adapter):
         assert c.close == Decimal("50500.00")
         assert c.volume == Decimal("100.0")
         assert c.trades_count == 1000
+
+
+@pytest.mark.asyncio
+async def test_get_klines_uses_weight_two(adapter):
+    """Klines endpoint should apply documented request weight."""
+    mock_kline = [
+        1700000000000, "50000.00", "51000.00", "49000.00", "50500.00", "100.0",
+        1700003599999, "5000000.00", 1000, "0", "0", "0"
+    ]
+
+    adapter._check_rate_limit = AsyncMock()  # type: ignore[method-assign]
+
+    async with respx.mock(base_url=adapter.base_url) as respx_mock:
+        respx_mock.get("/api/v3/klines").mock(
+            return_value=httpx.Response(200, json=[mock_kline])
+        )
+        await adapter.get_klines("BTCUSDT", "1h", limit=1)
+
+    adapter._check_rate_limit.assert_awaited_once_with(2)  # type: ignore[attr-defined]
 
 
 @pytest.mark.asyncio

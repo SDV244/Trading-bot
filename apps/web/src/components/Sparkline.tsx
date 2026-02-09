@@ -1,10 +1,11 @@
 type SparklineProps = {
   points: number[];
+  emptyLabel?: string;
 };
 
-export function Sparkline({ points }: SparklineProps) {
+export function Sparkline({ points, emptyLabel = "No data yet." }: SparklineProps) {
   if (points.length < 2) {
-    return <div className="text-xs text-slate-400">No equity data yet.</div>;
+    return <div className="text-xs text-slate-400">{emptyLabel}</div>;
   }
 
   const min = Math.min(...points);
@@ -35,4 +36,3 @@ export function Sparkline({ points }: SparklineProps) {
     </svg>
   );
 }
-

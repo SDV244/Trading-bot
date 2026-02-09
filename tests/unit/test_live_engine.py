@@ -24,6 +24,8 @@ async def test_live_engine_rejects_when_flag_disabled(monkeypatch: pytest.Monkey
 @pytest.mark.asyncio
 async def test_live_engine_requires_all_checklist_items(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRADING_LIVE_MODE", "true")
+    monkeypatch.setenv("BINANCE_API_KEY", "key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "secret")
     reload_settings()
     engine = LiveEngine()
     with pytest.raises(LiveEngineError, match="UI confirmation"):
@@ -55,6 +57,8 @@ class _MockLiveAdapter:
 @pytest.mark.asyncio
 async def test_live_engine_executes_with_mock_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("TRADING_LIVE_MODE", "true")
+    monkeypatch.setenv("BINANCE_API_KEY", "key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "secret")
     reload_settings()
     monkeypatch.setattr("packages.core.execution.live_engine.get_binance_live_adapter", lambda: _MockLiveAdapter())
     engine = LiveEngine()
@@ -64,4 +68,20 @@ async def test_live_engine_executes_with_mock_adapter(monkeypatch: pytest.Monkey
     )
     assert result.accepted is True
     assert result.order_id == "12345"
+    assert result.quantity == Decimal("0.0100")
+
+
+@pytest.mark.asyncio
+async def test_live_engine_normalizes_quantity_to_step(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRADING_LIVE_MODE", "true")
+    monkeypatch.setenv("BINANCE_API_KEY", "key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+    reload_settings()
+    monkeypatch.setattr("packages.core.execution.live_engine.get_binance_live_adapter", lambda: _MockLiveAdapter())
+    engine = LiveEngine()
+    result = await engine.execute_market_order(
+        OrderRequest(symbol="BTCUSDT", side="BUY", quantity=Decimal("0.01009"), order_type="MARKET"),
+        checklist=LiveSafetyChecklist(ui_confirmed=True, reauthenticated=True, safety_acknowledged=True),
+    )
+    assert result.accepted is True
     assert result.quantity == Decimal("0.0100")

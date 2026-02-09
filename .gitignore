@@ -38,9 +38,10 @@ htmlcov/
 .mypy_cache/
 
 # Environment
-.env
-.env.local
-.env.*.local
+.env*
+!.env.example
+.secrets/
+secrets/
 
 # Data
 data/

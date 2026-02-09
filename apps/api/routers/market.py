@@ -47,6 +47,25 @@ class DataStatusResponse(BaseModel):
     last_update: datetime | None
 
 
+class TimeframeRequirementResponse(BaseModel):
+    """Required/available candle count for one timeframe."""
+
+    required: int
+    available: int
+    ready: bool
+
+
+class DataRequirementsResponse(BaseModel):
+    """Data requirements for the active strategy."""
+
+    symbol: str
+    active_strategy: str
+    require_data_ready: bool
+    data_ready: bool
+    reasons: list[str]
+    timeframes: dict[str, TimeframeRequirementResponse]
+
+
 @router.get("/price", response_model=PriceResponse)
 async def get_current_price(
     symbol: str = Query("BTCUSDT", description="Trading pair"),
@@ -127,6 +146,35 @@ async def get_data_status(
         symbol=symbol,
         timeframes=timeframes,
         last_update=last_update,
+    )
+
+
+@router.get("/data/requirements", response_model=DataRequirementsResponse)
+async def get_data_requirements(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> DataRequirementsResponse:
+    """Get candle requirements and readiness for active strategy."""
+    from packages.core.database.session import get_session, init_database
+    from packages.core.trading_cycle import get_trading_cycle_service
+
+    await init_database()
+    async with get_session() as session:
+        readiness = await get_trading_cycle_service().get_data_readiness(session)
+
+    return DataRequirementsResponse(
+        symbol=readiness.symbol,
+        active_strategy=readiness.active_strategy,
+        require_data_ready=readiness.require_data_ready,
+        data_ready=readiness.data_ready,
+        reasons=readiness.reasons,
+        timeframes={
+            tf: TimeframeRequirementResponse(
+                required=status.required,
+                available=status.available,
+                ready=status.ready,
+            )
+            for tf, status in readiness.timeframes.items()
+        },
     )
 
 

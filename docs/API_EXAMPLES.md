@@ -9,6 +9,7 @@ All examples assume:
 PowerShell tip:
 
 - replace multiline `\` with backtick continuation or one-line commands.
+- for JSON bodies, prefer `Invoke-RestMethod` examples below.
 
 ## Postman Import
 
@@ -96,6 +97,17 @@ curl -s -X POST http://127.0.0.1:8000/api/system/state \
   -d '{"action":"resume","reason":"maintenance done","changed_by":"ops_user"}'
 ```
 
+PowerShell:
+
+```powershell
+$body = '{"action":"resume","reason":"maintenance done","changed_by":"ops_user"}'
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8000/api/system/state" `
+  -Headers @{ Authorization = "Bearer $env:TOKEN" } `
+  -ContentType "application/json" `
+  -Body $body
+```
+
 Emergency stop:
 
 ```bash
@@ -114,11 +126,43 @@ curl -s -X POST "http://127.0.0.1:8000/api/system/scheduler/start?interval_secon
   -H "Authorization: Bearer $TOKEN"
 ```
 
+If `TRADING_REQUIRE_DATA_READY=true` and warmup candles are missing, this returns `409`.
+
 Stop:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/api/system/scheduler/stop \
   -H "Authorization: Bearer $TOKEN"
+```
+
+System readiness:
+
+```bash
+curl -s http://127.0.0.1:8000/api/system/readiness \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Data requirements:
+
+```bash
+curl -s http://127.0.0.1:8000/api/market/data/requirements \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Notification status:
+
+```bash
+curl -s http://127.0.0.1:8000/api/system/notifications/status \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Send Telegram test:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/system/notifications/test \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Trading Bot test notification","body":"Connectivity check"}'
 ```
 
 ## 7) Run One Paper Cycle
@@ -136,6 +180,18 @@ Config:
 curl -s http://127.0.0.1:8000/api/trading/config \
   -H "Authorization: Bearer $TOKEN"
 ```
+
+Important fields in this response include:
+
+- `active_strategy`
+- `supported_strategies`
+- `require_data_ready`
+- `spot_position_mode`
+- `paper_starting_equity`
+- `advisor_interval_cycles`
+- `grid_lookback_1h`, `grid_atr_period_1h`, `grid_levels`
+- `grid_min_spacing_bps`, `grid_max_spacing_bps`
+- `grid_trend_tilt`, `grid_volatility_blend`
 
 Position:
 

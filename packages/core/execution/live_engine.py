@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from packages.adapters.binance_live import get_binance_live_adapter
@@ -47,6 +47,10 @@ class LiveEngine:
 
     def __init__(self) -> None:
         self.settings = get_settings()
+        if self.settings.trading.live_mode and (
+            not self.settings.binance.api_key or not self.settings.binance.api_secret
+        ):
+            raise LiveEngineError("TRADING_LIVE_MODE=true requires BINANCE_API_KEY and BINANCE_API_SECRET")
 
     async def execute_market_order(
         self,
@@ -55,12 +59,12 @@ class LiveEngine:
         client_order_id: str | None = None,
     ) -> LiveOrderResult:
         self._validate_preconditions(order, checklist)
-        await self._validate_symbol_filters(order.symbol, order.quantity)
+        normalized_quantity = await self._validate_symbol_filters(order.symbol, order.quantity)
 
         response = await get_binance_live_adapter().place_market_order(
             symbol=order.symbol,
             side=order.side,
-            quantity=order.quantity,
+            quantity=normalized_quantity,
             new_client_order_id=client_order_id,
         )
         status = str(response.get("status", "")).upper()
@@ -74,7 +78,7 @@ class LiveEngine:
             reason=f"exchange_status_{status or 'UNKNOWN'}",
             order_id=str(response.get("orderId")) if response.get("orderId") is not None else None,
             client_order_id=str(response.get("clientOrderId")) if response.get("clientOrderId") else client_order_id,
-            quantity=executed_qty if executed_qty > 0 else order.quantity,
+            quantity=executed_qty if executed_qty > 0 else normalized_quantity,
             price=avg_price,
             raw=response,
         )
@@ -95,20 +99,23 @@ class LiveEngine:
         if not checklist.safety_acknowledged:
             raise LiveEngineError("Safety checklist acknowledgement is required")
 
-    async def _validate_symbol_filters(self, symbol: str, quantity: Decimal) -> None:
+    async def _validate_symbol_filters(self, symbol: str, quantity: Decimal) -> Decimal:
         info = await get_binance_live_adapter().get_exchange_filters(symbol)
         filters = {f.get("filterType"): f for f in info.get("filters", [])}
 
+        normalized_quantity = quantity
         lot = filters.get("LOT_SIZE")
         if lot is not None:
             min_qty = Decimal(str(lot.get("minQty", "0")))
             step_size = Decimal(str(lot.get("stepSize", "0.00000001")))
-            if quantity < min_qty:
-                raise LiveEngineError(f"quantity below minQty ({min_qty})")
             if step_size > 0:
-                units = (quantity / step_size).normalize()
-                if units != units.to_integral_value():
-                    raise LiveEngineError(f"quantity must align with stepSize ({step_size})")
+                step_units = (quantity / step_size).to_integral_value(rounding=ROUND_DOWN)
+                normalized_quantity = (step_units * step_size).quantize(step_size, rounding=ROUND_DOWN)
+            if normalized_quantity < min_qty:
+                raise LiveEngineError(f"quantity below minQty ({min_qty})")
+            if normalized_quantity <= 0:
+                raise LiveEngineError("quantity rounds down to zero after LOT_SIZE precision normalization")
 
         # MIN_NOTIONAL is exchange-enforced and depends on execution price.
         # We keep authoritative validation at order placement response.
+        return normalized_quantity

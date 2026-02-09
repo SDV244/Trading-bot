@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from loguru import logger
-from telegram import Bot
 
 from packages.core.config import get_settings
+
+if TYPE_CHECKING:
+    from telegram import Bot
 
 
 class TelegramNotifier:
@@ -16,7 +20,15 @@ class TelegramNotifier:
         self.bot_token = settings.telegram.bot_token
         self.chat_id = settings.telegram.chat_id
         self._enabled = bool(self.bot_token and self.chat_id)
-        self._bot: Bot | None = Bot(token=self.bot_token) if self._enabled else None
+        self._bot: Bot | None = None
+        if self._enabled:
+            self._bot = self._build_bot(self.bot_token)
+
+    @staticmethod
+    def _build_bot(token: str) -> Bot:
+        from telegram import Bot
+
+        return Bot(token=token)
 
     @property
     def enabled(self) -> bool:

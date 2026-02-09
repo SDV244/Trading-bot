@@ -4,13 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from packages.core.ai.drl_optimizer import DRLOptimizer
 from packages.core.database.models import EquitySnapshot, Fill, MetricsSnapshot
+
+if TYPE_CHECKING:
+    from packages.core.ai.drl_optimizer import DRLOptimizer
 
 
 @dataclass(slots=True, frozen=True)
@@ -32,7 +34,7 @@ class AIAdvisor:
 
     def __init__(self, *, ttl_hours: int = 2) -> None:
         self.ttl_hours = ttl_hours
-        self.optimizer = DRLOptimizer()
+        self.optimizer: DRLOptimizer | None = None
 
     async def generate_proposals(self, session: AsyncSession) -> list[AIProposal]:
         """
@@ -82,6 +84,10 @@ class AIAdvisor:
                 )
             )
 
+        grid_tuning = self._grid_tuning_proposal(latest_metrics)
+        if grid_tuning is not None:
+            proposals.append(grid_tuning)
+
         drl = await self._drl_proposal(session)
         if drl is not None:
             proposals.append(
@@ -120,7 +126,99 @@ class AIAdvisor:
         slippage = float(avg_slippage)
         return slippage if slippage >= 5.0 else None
 
+    def _grid_tuning_proposal(self, latest_metrics: MetricsSnapshot) -> AIProposal | None:
+        if latest_metrics.strategy_name != "smart_grid_ai":
+            return None
+
+        win_rate = latest_metrics.win_rate if latest_metrics.win_rate is not None else 0.0
+        total_trades = latest_metrics.total_trades
+        max_drawdown = latest_metrics.max_drawdown
+
+        if total_trades < 20:
+            return None
+
+        if max_drawdown >= 0.08:
+            return AIProposal(
+                title="Grid risk-off tuning due to elevated drawdown",
+                proposal_type="grid_tuning",
+                description=(
+                    "Drawdown is elevated for smart_grid_ai. Suggest widening spacing "
+                    "and reducing active grid levels to lower churn."
+                ),
+                diff={
+                    "trading": {
+                        "grid_min_spacing_bps": 35,
+                        "grid_max_spacing_bps": 280,
+                        "grid_levels": 5,
+                    }
+                },
+                expected_impact="Lower turnover and reduce drawdown pressure in volatile phases.",
+                evidence={
+                    "strategy_name": latest_metrics.strategy_name,
+                    "max_drawdown": max_drawdown,
+                    "win_rate": win_rate,
+                    "total_trades": total_trades,
+                },
+                confidence=0.78,
+                ttl_hours=self.ttl_hours,
+            )
+
+        if win_rate < 0.42:
+            return AIProposal(
+                title="Grid spacing increase for low win-rate conditions",
+                proposal_type="grid_tuning",
+                description=(
+                    "Win rate dropped below threshold. Suggest wider spacing to avoid overtrading."
+                ),
+                diff={
+                    "trading": {
+                        "grid_min_spacing_bps": 32,
+                        "grid_max_spacing_bps": 260,
+                        "grid_volatility_blend": 0.85,
+                    }
+                },
+                expected_impact="Fewer low-quality grid flips and improved net expectancy after fees.",
+                evidence={
+                    "strategy_name": latest_metrics.strategy_name,
+                    "max_drawdown": max_drawdown,
+                    "win_rate": win_rate,
+                    "total_trades": total_trades,
+                },
+                confidence=0.71,
+                ttl_hours=self.ttl_hours,
+            )
+
+        if win_rate > 0.60 and max_drawdown < 0.06:
+            return AIProposal(
+                title="Grid efficiency tuning in stable regime",
+                proposal_type="grid_tuning",
+                description=(
+                    "Performance is stable. Suggest modestly tighter grid spacing to capture "
+                    "more mean-reverting moves."
+                ),
+                diff={
+                    "trading": {
+                        "grid_min_spacing_bps": 22,
+                        "grid_max_spacing_bps": 200,
+                        "grid_levels": 7,
+                    }
+                },
+                expected_impact="Higher opportunity capture while maintaining acceptable drawdown.",
+                evidence={
+                    "strategy_name": latest_metrics.strategy_name,
+                    "max_drawdown": max_drawdown,
+                    "win_rate": win_rate,
+                    "total_trades": total_trades,
+                },
+                confidence=0.66,
+                ttl_hours=self.ttl_hours,
+            )
+
+        return None
+
     async def _drl_proposal(self, session: AsyncSession) -> Any | None:
+        from packages.core.ai.drl_optimizer import DRLOptimizer
+
         result = await session.execute(
             select(EquitySnapshot)
             .where(EquitySnapshot.is_paper.is_(True))
@@ -139,6 +237,8 @@ class AIAdvisor:
             rewards.append((curr - prev) / prev if prev else 0.0)
         exposures = [0.2 for _ in equity]
         try:
+            if self.optimizer is None:
+                self.optimizer = DRLOptimizer()
             self.optimizer.train(rewards, timesteps=512)
             if not self.optimizer.walk_forward_validate(
                 equity_series=equity,

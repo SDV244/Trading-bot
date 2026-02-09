@@ -5,6 +5,7 @@ import { AppLayout } from "./components/AppLayout";
 import { ProtectedRoute } from "./components/ProtectedRoute";
 import { DashboardProvider } from "./dashboard";
 import { ApprovalsPage } from "./pages/ApprovalsPage";
+import { ChartPage } from "./pages/ChartPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { ControlsPage } from "./pages/ControlsPage";
 import { HomePage } from "./pages/HomePage";
@@ -29,6 +30,7 @@ function AppRoutes() {
       >
         <Route index element={<HomePage />} />
         <Route path="trading" element={<TradingPage />} />
+        <Route path="chart" element={<ChartPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route
           path="approvals"

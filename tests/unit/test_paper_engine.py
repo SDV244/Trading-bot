@@ -111,3 +111,20 @@ def test_limit_partial_fill_supported() -> None:
     assert fill.status == "PARTIALLY_FILLED"
     assert fill.filled_quantity == Decimal("0.01000")
     assert fill.remaining_quantity == Decimal("0.01000")
+
+
+def test_symbol_allowlist_rejects_unknown_symbol() -> None:
+    engine = PaperEngine(allowed_symbols={"ETHUSDT"})
+    order = OrderRequest(symbol="BTCUSDT", side="BUY", quantity=Decimal("0.01000"))
+
+    with pytest.raises(PaperExecutionError, match="not allowed"):
+        engine.execute_market_order(order=order, last_price=Decimal("50000"))
+
+
+def test_symbol_allowlist_accepts_configured_symbol() -> None:
+    engine = PaperEngine(allowed_symbols={"ETHUSDT"})
+    order = OrderRequest(symbol="ETHUSDT", side="BUY", quantity=Decimal("0.10000"))
+
+    fill = engine.execute_market_order(order=order, last_price=Decimal("3000"))
+    assert fill.status == "FILLED"
+    assert fill.symbol == "ETHUSDT"

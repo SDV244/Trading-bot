@@ -38,6 +38,9 @@ class MeanReversionStrategy(Strategy):
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
 
+    def data_requirements(self) -> dict[str, int]:
+        return {"1h": self.lookback + 1, "4h": 0}
+
     def generate_signal(self, context: StrategyContext) -> Signal:
         closes = [float(c.close) for c in context.candles_1h]
         if len(closes) < self.lookback + 1:

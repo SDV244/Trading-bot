@@ -11,7 +11,69 @@ export type SchedulerStatus = {
   interval_seconds: number;
   last_run_at: string | null;
   last_error: string | null;
-  last_result: Record<string, unknown> | null;
+  last_result: SchedulerCycleResult | null;
+};
+
+export type SchedulerCycleResult = {
+  symbol: string;
+  signal_side: string;
+  signal_reason: string;
+  risk_action: string;
+  risk_reason: string;
+  executed: boolean;
+  order_id: number | null;
+  fill_id: string | null;
+  quantity: string;
+  price: string | null;
+  executed_at?: string;
+};
+
+export type TimeframeReadiness = {
+  required: number;
+  available: number;
+  ready: boolean;
+};
+
+export type MarketPrice = {
+  symbol: string;
+  price: string;
+  timestamp: string;
+};
+
+export type MarketCandle = {
+  symbol: string;
+  timeframe: string;
+  open_time: string;
+  close_time: string;
+  open: string;
+  high: string;
+  low: string;
+  close: string;
+  volume: string;
+  trades_count: number;
+};
+
+export type SystemReadiness = {
+  ready: boolean;
+  state: string;
+  can_trade: boolean;
+  scheduler_running: boolean;
+  data_ready: boolean;
+  require_data_ready: boolean;
+  active_strategy: string;
+  reasons: string[];
+  timeframes: Record<string, TimeframeReadiness>;
+};
+
+export type NotificationStatus = {
+  enabled: boolean;
+  has_bot_token: boolean;
+  has_chat_id: boolean;
+};
+
+export type NotificationTestResponse = {
+  delivered: boolean;
+  message: string;
 };
 
 export type Position = {
@@ -41,7 +103,29 @@ export type Metrics = {
 export type TradingConfig = {
   trading_pair: string;
   timeframes: string[];
+  supported_strategies: string[];
   live_mode: boolean;
+  active_strategy: string;
+  require_data_ready: boolean;
+  spot_position_mode: string;
+  paper_starting_equity: number;
+  advisor_interval_cycles: number;
+  grid_lookback_1h: number;
+  grid_atr_period_1h: number;
+  grid_levels: number;
+  grid_spacing_mode: string;
+  grid_min_spacing_bps: number;
+  grid_max_spacing_bps: number;
+  grid_trend_tilt: number;
+  grid_volatility_blend: number;
+  grid_take_profit_buffer: number;
+  grid_stop_loss_buffer: number;
+  grid_cooldown_seconds: number;
+  grid_auto_inventory_bootstrap: boolean;
+  grid_bootstrap_fraction: number;
+  grid_enforce_fee_floor: boolean;
+  grid_min_net_profit_bps: number;
+  grid_out_of_bounds_alert_cooldown_minutes: number;
   risk_per_trade: number;
   max_daily_loss: number;
   max_exposure: number;
@@ -151,7 +235,11 @@ export type AuthStatus = {
 
 export type Role = "viewer" | "operator" | "admin";
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000";
+const rawApiBase = String(import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000");
+const API_BASE = rawApiBase
+  .trim()
+  .split(/\s+/)[0]
+  .replace(/\/+$/, "");
 const TOKEN_KEY = "tb_access_token";
 
 export class ApiError extends Error {
@@ -184,10 +272,20 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     headers.set("Authorization", `Bearer ${token}`);
   }
 
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...init,
+      headers,
+    });
+  } catch (error) {
+    if (error instanceof Error) {
+      throw new Error(
+        `${error.message}. API base is "${API_BASE}". Check VITE_API_BASE_URL and that the API server is running.`,
+      );
+    }
+    throw error;
+  }
 
   if (!response.ok) {
     const body = await response.text();
@@ -218,6 +316,13 @@ export const api = {
     }),
   me: () => fetchJson<AuthStatus>("/api/auth/me"),
   getSystemState: () => fetchJson<SystemState>("/api/system/state"),
+  getSystemReadiness: () => fetchJson<SystemReadiness>("/api/system/readiness"),
+  getNotificationStatus: () => fetchJson<NotificationStatus>("/api/system/notifications/status"),
+  sendTestNotification: (title = "Trading Bot test notification", body = "Test message from dashboard") =>
+    fetchJson<NotificationTestResponse>("/api/system/notifications/test", {
+      method: "POST",
+      body: JSON.stringify({ title, body }),
+    }),
   setSystemState: (action: "pause" | "resume" | "emergency_stop" | "manual_resume", reason: string) =>
     fetchJson<SystemState>("/api/system/state", {
       method: "POST",
@@ -244,6 +349,10 @@ export const api = {
   getFills: (limit = 10) => fetchJson<Fill[]>(`/api/trading/fills${buildQuery({ limit })}`),
   getEquityHistory: (days = 30) =>
     fetchJson<EquityPoint[]>(`/api/trading/equity/history${buildQuery({ days })}`),
+  getMarketPrice: (symbol: string) =>
+    fetchJson<MarketPrice>(`/api/market/price${buildQuery({ symbol })}`),
+  getMarketCandles: (symbol: string, timeframe = "1h", limit = 120) =>
+    fetchJson<MarketCandle[]>(`/api/market/candles${buildQuery({ symbol, timeframe, limit })}`),
   listApprovals: (status?: string, limit = 100) =>
     fetchJson<Approval[]>(`/api/ai/approvals${buildQuery({ status, limit })}`),
   generateProposals: () =>
@@ -299,4 +408,3 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 };
-

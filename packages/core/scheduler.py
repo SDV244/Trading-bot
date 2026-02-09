@@ -7,8 +7,11 @@ from typing import Any
 
 from loguru import logger
 
+from packages.adapters.telegram_bot import get_telegram_notifier
 from packages.core.ai import get_ai_advisor, get_approval_gate
+from packages.core.config import get_settings
 from packages.core.database.session import get_session
+from packages.core.state import get_state_manager
 from packages.core.trading_cycle import CycleResult, get_trading_cycle_service
 
 
@@ -26,15 +29,22 @@ class SchedulerStatus:
 class TradingScheduler:
     """Simple async loop scheduler for paper cycle execution."""
 
-    def __init__(self, interval_seconds: int = 60, advisor_interval_cycles: int = 30) -> None:
+    def __init__(self, interval_seconds: int = 60, advisor_interval_cycles: int | None = None) -> None:
+        settings = get_settings()
         self.interval_seconds = interval_seconds
-        self.advisor_interval_cycles = max(1, advisor_interval_cycles)
+        interval = (
+            advisor_interval_cycles
+            if advisor_interval_cycles is not None
+            else settings.trading.advisor_interval_cycles
+        )
+        self.advisor_interval_cycles = max(1, interval)
         self._running = False
         self._task: asyncio.Task[None] | None = None
         self._last_run_at: datetime | None = None
         self._last_error: str | None = None
         self._last_result: dict[str, Any] | None = None
         self._cycles = 0
+        self._last_heartbeat_at: datetime | None = None
 
     @property
     def running(self) -> bool:
@@ -113,6 +123,7 @@ class TradingScheduler:
 
                 self._last_result = self._serialize_result(result)
                 self._last_error = None
+                await self._maybe_send_heartbeat()
             except Exception as e:
                 self._last_error = str(e)
                 logger.exception("Trading scheduler cycle failed")
@@ -122,6 +133,35 @@ class TradingScheduler:
         payload = asdict(result)
         payload["executed_at"] = datetime.now(UTC).isoformat()
         return payload
+
+    async def _maybe_send_heartbeat(self) -> None:
+        settings = get_settings()
+        if not settings.telegram.heartbeat_enabled:
+            return
+        interval_hours = max(1, settings.telegram.heartbeat_hours)
+        now = datetime.now(UTC)
+        if self._last_heartbeat_at is not None:
+            elapsed_hours = (now - self._last_heartbeat_at).total_seconds() / 3600
+            if elapsed_hours < interval_hours:
+                return
+
+        notifier = get_telegram_notifier()
+        if not notifier.enabled:
+            return
+        state = get_state_manager().current
+        last_result = self._last_result or {}
+        sent = await notifier.send_info(
+            "Trading bot heartbeat",
+            (
+                f"State: {state.state.value}\n"
+                f"Scheduler running: {self._running}\n"
+                f"Cycles: {self._cycles}\n"
+                f"Last signal: {last_result.get('signal_side', 'N/A')}\n"
+                f"Last risk reason: {last_result.get('risk_reason', 'N/A')}"
+            ),
+        )
+        if sent:
+            self._last_heartbeat_at = now
 
 
 _trading_scheduler: TradingScheduler | None = None

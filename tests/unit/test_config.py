@@ -12,6 +12,24 @@ class TestSettings:
         """Default settings are applied correctly."""
         # Clear any existing env vars
         monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+        monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "trend_ema")
+        monkeypatch.setenv("TRADING_ADVISOR_INTERVAL_CYCLES", "30")
+        monkeypatch.setenv("TRADING_SPOT_POSITION_MODE", "long_flat")
+        monkeypatch.setenv("TRADING_PAPER_STARTING_EQUITY", "10000")
+        monkeypatch.setenv("TRADING_GRID_LEVELS", "6")
+        monkeypatch.setenv("TRADING_GRID_MIN_SPACING_BPS", "25")
+        monkeypatch.setenv("TRADING_GRID_MAX_SPACING_BPS", "220")
+        monkeypatch.setenv("TRADING_GRID_TREND_TILT", "1.25")
+        monkeypatch.setenv("TRADING_GRID_VOLATILITY_BLEND", "0.7")
+        monkeypatch.setenv("TRADING_GRID_TAKE_PROFIT_BUFFER", "0.02")
+        monkeypatch.setenv("TRADING_GRID_STOP_LOSS_BUFFER", "0.05")
+        monkeypatch.setenv("TRADING_GRID_BOOTSTRAP_FRACTION", "1.0")
+        monkeypatch.setenv("TRADING_GRID_ENFORCE_FEE_FLOOR", "false")
+        monkeypatch.setenv("TRADING_GRID_COOLDOWN_SECONDS", "0")
+        monkeypatch.setenv("TRADING_GRID_MIN_NET_PROFIT_BPS", "30")
+        monkeypatch.setenv("RISK_PER_TRADE", "0.005")
+        monkeypatch.setenv("RISK_MAX_DAILY_LOSS", "0.02")
+        monkeypatch.setenv("RISK_MAX_EXPOSURE", "0.25")
 
         # Reset cached settings
         import packages.core.config as config_module
@@ -22,6 +40,27 @@ class TestSettings:
 
         assert settings.trading.pair == "BTCUSDT"
         assert settings.trading.live_mode is False
+        assert settings.trading.active_strategy == "trend_ema"
+        assert settings.trading.require_data_ready is True
+        assert settings.trading.spot_position_mode == "long_flat"
+        assert settings.trading.grid_lookback_1h == 120
+        assert settings.trading.grid_atr_period_1h == 14
+        assert settings.trading.grid_levels == 6
+        assert settings.trading.grid_spacing_mode == "geometric"
+        assert settings.trading.grid_min_spacing_bps == 25
+        assert settings.trading.grid_max_spacing_bps == 220
+        assert settings.trading.grid_trend_tilt == 1.25
+        assert settings.trading.grid_volatility_blend == 0.7
+        assert settings.trading.grid_take_profit_buffer == 0.02
+        assert settings.trading.grid_stop_loss_buffer == 0.05
+        assert settings.trading.grid_cooldown_seconds == 0
+        assert settings.trading.grid_auto_inventory_bootstrap is True
+        assert settings.trading.grid_bootstrap_fraction == 1.0
+        assert settings.trading.grid_enforce_fee_floor is False
+        assert settings.trading.grid_min_net_profit_bps == 30
+        assert settings.trading.grid_out_of_bounds_alert_cooldown_minutes == 60
+        assert settings.trading.advisor_interval_cycles == 30
+        assert settings.trading.paper_starting_equity == 10000.0
         assert settings.risk.per_trade == 0.005
         assert settings.risk.max_daily_loss == 0.02
         assert settings.approval.timeout_hours == 2
@@ -47,6 +86,7 @@ class TestSettings:
         settings = config_module.get_settings()
 
         assert "testnet" in settings.binance.base_url
+        assert "testnet" in settings.binance.trading_base_url
         assert "testnet" in settings.binance.ws_url
 
     def test_binance_production_url(self, monkeypatch):
@@ -60,6 +100,7 @@ class TestSettings:
 
         assert "testnet" not in settings.binance.base_url
         assert "api.binance.com" in settings.binance.base_url
+        assert settings.binance.public_market_data_url == "https://data-api.binance.vision"
 
     def test_reload_settings(self, monkeypatch):
         """Settings can be reloaded."""
@@ -73,3 +114,65 @@ class TestSettings:
         monkeypatch.setenv("TRADING_PAIR", "BTCUSDT")
         settings2 = config_module.reload_settings()
         assert settings2.trading.pair == "BTCUSDT"
+
+    def test_paper_starting_equity_override(self, monkeypatch):
+        """Paper starting equity can be overridden from env."""
+        monkeypatch.setenv("TRADING_PAPER_STARTING_EQUITY", "25000")
+
+        import packages.core.config as config_module
+
+        config_module._settings = None
+        settings = config_module.get_settings()
+        assert settings.trading.paper_starting_equity == 25000.0
+
+    def test_spot_position_mode_override(self, monkeypatch):
+        """Spot position mode can be overridden from env."""
+        monkeypatch.setenv("TRADING_SPOT_POSITION_MODE", "incremental")
+
+        import packages.core.config as config_module
+
+        config_module._settings = None
+        settings = config_module.get_settings()
+        assert settings.trading.spot_position_mode == "incremental"
+
+    def test_grid_settings_override(self, monkeypatch):
+        """Grid strategy settings can be overridden from env."""
+        monkeypatch.setenv("TRADING_GRID_LOOKBACK_1H", "160")
+        monkeypatch.setenv("TRADING_GRID_ATR_PERIOD_1H", "20")
+        monkeypatch.setenv("TRADING_GRID_LEVELS", "8")
+        monkeypatch.setenv("TRADING_GRID_SPACING_MODE", "arithmetic")
+        monkeypatch.setenv("TRADING_GRID_MIN_SPACING_BPS", "30")
+        monkeypatch.setenv("TRADING_GRID_MAX_SPACING_BPS", "260")
+        monkeypatch.setenv("TRADING_GRID_TREND_TILT", "1.5")
+        monkeypatch.setenv("TRADING_GRID_VOLATILITY_BLEND", "0.9")
+        monkeypatch.setenv("TRADING_GRID_TAKE_PROFIT_BUFFER", "0.03")
+        monkeypatch.setenv("TRADING_GRID_STOP_LOSS_BUFFER", "0.07")
+        monkeypatch.setenv("TRADING_GRID_COOLDOWN_SECONDS", "120")
+        monkeypatch.setenv("TRADING_GRID_AUTO_INVENTORY_BOOTSTRAP", "false")
+        monkeypatch.setenv("TRADING_GRID_BOOTSTRAP_FRACTION", "0.6")
+        monkeypatch.setenv("TRADING_GRID_ENFORCE_FEE_FLOOR", "true")
+        monkeypatch.setenv("TRADING_GRID_MIN_NET_PROFIT_BPS", "40")
+        monkeypatch.setenv("TRADING_GRID_OUT_OF_BOUNDS_ALERT_COOLDOWN_MINUTES", "30")
+        monkeypatch.setenv("TRADING_ADVISOR_INTERVAL_CYCLES", "15")
+
+        import packages.core.config as config_module
+
+        config_module._settings = None
+        settings = config_module.get_settings()
+        assert settings.trading.grid_lookback_1h == 160
+        assert settings.trading.grid_atr_period_1h == 20
+        assert settings.trading.grid_levels == 8
+        assert settings.trading.grid_spacing_mode == "arithmetic"
+        assert settings.trading.grid_min_spacing_bps == 30
+        assert settings.trading.grid_max_spacing_bps == 260
+        assert settings.trading.grid_trend_tilt == 1.5
+        assert settings.trading.grid_volatility_blend == 0.9
+        assert settings.trading.grid_take_profit_buffer == 0.03
+        assert settings.trading.grid_stop_loss_buffer == 0.07
+        assert settings.trading.grid_cooldown_seconds == 120
+        assert settings.trading.grid_auto_inventory_bootstrap is False
+        assert settings.trading.grid_bootstrap_fraction == 0.6
+        assert settings.trading.grid_enforce_fee_floor is True
+        assert settings.trading.grid_min_net_profit_bps == 40
+        assert settings.trading.grid_out_of_bounds_alert_cooldown_minutes == 30
+        assert settings.trading.advisor_interval_cycles == 15

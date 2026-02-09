@@ -12,8 +12,35 @@ export function ConfigPage() {
         <div className="mt-3 space-y-2 text-xs text-slate-200">
           <p>Pair: {config?.trading_pair ?? "-"}</p>
           <p>Timeframes: {config?.timeframes.join(", ") ?? "-"}</p>
+          <p>Active Strategy: {config?.active_strategy ?? "-"}</p>
+          <p>Supported Strategies: {config?.supported_strategies.join(", ") ?? "-"}</p>
           <p>Live Mode: {String(config?.live_mode ?? false)}</p>
+          <p>Require Data Ready: {String(config?.require_data_ready ?? false)}</p>
+          <p>Spot Position Mode: {config?.spot_position_mode ?? "-"}</p>
+          <p>AI Advisor Interval: every {config?.advisor_interval_cycles ?? "-"} cycles</p>
+          <p>Paper Starting Equity: {formatNumber(config?.paper_starting_equity ?? 0, 2)} USDT</p>
           <p>Approval Timeout: {config?.approval_timeout_hours ?? "-"} hours</p>
+        </div>
+      </article>
+      <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">
+        <h2 className="font-heading text-lg font-bold text-white">Smart Grid Params</h2>
+        <div className="mt-3 space-y-2 text-xs text-slate-200">
+          <p>Lookback 1h: {config?.grid_lookback_1h ?? "-"}</p>
+          <p>ATR Period 1h: {config?.grid_atr_period_1h ?? "-"}</p>
+          <p>Grid Levels: {config?.grid_levels ?? "-"}</p>
+          <p>Spacing Mode: {config?.grid_spacing_mode ?? "-"}</p>
+          <p>Grid Min Spacing: {config?.grid_min_spacing_bps ?? "-"} bps</p>
+          <p>Grid Max Spacing: {config?.grid_max_spacing_bps ?? "-"} bps</p>
+          <p>Trend Tilt: {formatNumber(config?.grid_trend_tilt ?? 0, 2)}</p>
+          <p>Volatility Blend: {formatNumber(config?.grid_volatility_blend ?? 0, 2)}</p>
+          <p>Take Profit Buffer: {formatNumber((config?.grid_take_profit_buffer ?? 0) * 100, 2)}%</p>
+          <p>Stop Loss Buffer: {formatNumber((config?.grid_stop_loss_buffer ?? 0) * 100, 2)}%</p>
+          <p>Cooldown: {config?.grid_cooldown_seconds ?? "-"} s</p>
+          <p>Auto Bootstrap Inventory: {String(config?.grid_auto_inventory_bootstrap ?? false)}</p>
+          <p>Bootstrap Fraction: {formatNumber((config?.grid_bootstrap_fraction ?? 0) * 100, 0)}%</p>
+          <p>Enforce Fee Floor: {String(config?.grid_enforce_fee_floor ?? false)}</p>
+          <p>Min Net Profit Floor: {config?.grid_min_net_profit_bps ?? "-"} bps</p>
+          <p>Out-of-Bounds Alert Cooldown: {config?.grid_out_of_bounds_alert_cooldown_minutes ?? "-"} min</p>
         </div>
       </article>
       <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">
@@ -33,4 +60,3 @@ export function ConfigPage() {
     </section>
   );
 }
-

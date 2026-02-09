@@ -1,12 +1,15 @@
 import { NavLink, Outlet } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
 
 import { useAuth } from "../auth";
 import { useDashboard } from "../dashboard";
+import { formatRelativeSeconds } from "../utils";
 import { StateBadge } from "./Badge";
 
 const NAV_ITEMS = [
   { to: "/", label: "Home" },
   { to: "/trading", label: "Trading" },
+  { to: "/chart", label: "Chart" },
   { to: "/config", label: "Config" },
   { to: "/approvals", label: "AI Approvals" },
   { to: "/logs", label: "Logs" },
@@ -16,6 +19,14 @@ const NAV_ITEMS = [
 export function AppLayout() {
   const { user, authEnabled, logout } = useAuth();
   const { data, error } = useDashboard();
+  const [nowMs, setNowMs] = useState(() => Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const syncLabel = useMemo(() => formatRelativeSeconds(data.lastUpdatedAt, nowMs), [data.lastUpdatedAt, nowMs]);
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-ink via-sea to-[#102736] text-slate">
@@ -35,6 +46,7 @@ export function AppLayout() {
               {data.system ? <StateBadge value={data.system.state} /> : null}
             </div>
             <div className="flex items-center gap-2 text-xs">
+              <span className="rounded-md border border-white/20 bg-white/5 px-2 py-1">Sync: {syncLabel}</span>
               <span className="rounded-md border border-white/20 bg-white/5 px-2 py-1">
                 {authEnabled ? `Role: ${user?.role ?? "guest"}` : "Auth: disabled"}
               </span>
@@ -78,4 +90,3 @@ export function AppLayout() {
     </div>
   );
 }
-

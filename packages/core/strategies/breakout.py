@@ -15,6 +15,9 @@ class BreakoutStrategy(Strategy):
     confirmation_bars_1h: int = 2
     breakout_buffer_bps: int = 10
 
+    def data_requirements(self) -> dict[str, int]:
+        return {"1h": self.confirmation_bars_1h, "4h": self.lookback_4h}
+
     def generate_signal(self, context: StrategyContext) -> Signal:
         if len(context.candles_4h) < self.lookback_4h or len(context.candles_1h) < self.confirmation_bars_1h:
             return Signal(side="HOLD", confidence=0.0, reason="insufficient_data", indicators={})

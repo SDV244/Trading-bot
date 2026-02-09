@@ -17,8 +17,11 @@ This checklist helps new developers and operators start safely and consistently.
 - [ ] Run `poetry install`
 - [ ] Run `cd apps/web && npm install`
 - [ ] Create `.env` from `.env.example`
-- [ ] Set Binance testnet credentials
+- [ ] Configure `APP_SECRETS_DIR` and create local `.secrets/` files
+- [ ] Keep `BINANCE_TESTNET=false` for paper data
 - [ ] Set `TRADING_LIVE_MODE=false`
+- [ ] Set `TRADING_SPOT_POSITION_MODE=long_flat` for clearer spot behavior
+- [ ] Set `TRADING_PAPER_STARTING_EQUITY` to realistic paper capital (for example `10000`)
 - [ ] Set auth values for local RBAC testing (optional but recommended)
 
 ## 3) Verify Build + Tests
@@ -77,4 +80,3 @@ This checklist helps new developers and operators start safely and consistently.
 - [ ] Alerts/notifications tested (Telegram if enabled)
 - [ ] Backup/restore path tested for SQLite
 - [ ] Incident runbook reviewed by operators
-

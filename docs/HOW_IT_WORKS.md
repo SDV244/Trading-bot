@@ -38,6 +38,16 @@ This document explains the runtime flow end-to-end.
 6. compute and store metrics/equity snapshots
 7. append audit event(s)
 
+Before scheduler start, the system evaluates strategy candle requirements.
+If `TRADING_REQUIRE_DATA_READY=true` and warmup is incomplete, scheduler start is blocked.
+Paper risk sizing/equity baselines use `TRADING_PAPER_STARTING_EQUITY`.
+When `TRADING_ACTIVE_STRATEGY=smart_grid_ai`, the cycle uses adaptive grid spacing
+based on ATR/volatility plus 4h regime tilt.
+Optional controls for smart-grid operations:
+- `TRADING_GRID_SPACING_MODE=geometric|arithmetic`
+- `TRADING_GRID_COOLDOWN_SECONDS` to avoid overtrading bursts
+- `TRADING_GRID_AUTO_INVENTORY_BOOTSTRAP=true` to seed initial spot inventory when flat + SELL signal appears
+
 ## 4) State Machine
 
 Defined in `packages/core/state.py`.
@@ -57,11 +67,15 @@ Rules:
 ## 5) AI Proposal + Approval Flow
 
 1. Advisor (`packages/core/ai/advisor.py`) generates proposals from current data/metrics.
+   - for `smart_grid_ai`, advisor can emit grid-specific tuning proposals
+     (`grid_levels`, spacing bounds, volatility blend) based on win-rate/drawdown.
 2. Proposal is saved as `PENDING` in `approvals`.
 3. Operator approves/rejects through API/web.
 4. Expiry checker marks timed-out proposals as `EXPIRED`.
 5. Expiry can trigger safety behavior (including emergency stop policy paths).
 6. All steps are logged in `events_log`.
+7. Scheduler invokes advisor every `TRADING_ADVISOR_INTERVAL_CYCLES` cycles.
+8. Scheduler can emit Telegram heartbeat notifications every `TELEGRAM_HEARTBEAT_HOURS`.
 
 ## 6) Security Model
 
@@ -92,4 +106,3 @@ Core tables:
 - `config`
 
 Each table has targeted indexes for common operational queries.
-

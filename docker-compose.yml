@@ -7,12 +7,19 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: 8000
       DATABASE_URL: sqlite+aiosqlite:///./data/trading.db
-      BINANCE_TESTNET: "true"
+      BINANCE_TESTNET: "false"
+      BINANCE_MARKET_DATA_BASE_URL: https://data-api.binance.vision
       TRADING_LIVE_MODE: "false"
+      TRADING_ACTIVE_STRATEGY: trend_ema
+      TRADING_REQUIRE_DATA_READY: "true"
+      TRADING_SPOT_POSITION_MODE: ${TRADING_SPOT_POSITION_MODE:-long_flat}
+      TRADING_PAPER_STARTING_EQUITY: ${TRADING_PAPER_STARTING_EQUITY:-10000}
+      APP_SECRETS_DIR: /run/secrets/trading-bot
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
+      - ./.secrets:/run/secrets/trading-bot:ro
     restart: unless-stopped
 
   web:
