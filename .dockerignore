@@ -1,0 +1,16 @@
+.git
+.github
+.pytest_cache
+.ruff_cache
+.mypy_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+node_modules
+apps/web/node_modules
+apps/web/dist
+tests
+test_output*.txt

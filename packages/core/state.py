@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SystemState(str, Enum):
@@ -23,14 +23,13 @@ class SystemState(str, Enum):
 class StateSnapshot(BaseModel):
     """Immutable snapshot of system state."""
 
+    model_config = ConfigDict(frozen=True)
+
     state: SystemState
     reason: str = ""
     changed_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     changed_by: str = "system"
     metadata: dict[str, Any] = Field(default_factory=dict)
-
-    class Config:
-        frozen = True
 
 
 class StateManager:

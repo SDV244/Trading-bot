@@ -2,9 +2,7 @@
 Tests for configuration settings.
 """
 
-import os
 
-import pytest
 
 
 class TestSettings:

@@ -6,8 +6,15 @@ Async SQLAlchemy engine and session factory for SQLite.
 
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from packages.core.config import get_settings
 from packages.core.database.models import Base
@@ -17,11 +24,14 @@ _engine = None
 _session_factory = None
 
 
-def get_engine():
+def get_engine() -> AsyncEngine:
     """Get or create the async engine."""
     global _engine
     if _engine is None:
         settings = get_settings()
+        url = make_url(settings.database.url)
+        if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
+            Path(url.database).parent.mkdir(parents=True, exist_ok=True)
         _engine = create_async_engine(
             settings.database.url,
             echo=settings.log.level == "DEBUG",
