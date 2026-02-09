@@ -1,0 +1,69 @@
+flowchart LR
+    subgraph UI["Local Operator UI"]
+        Web["React Dashboard<br/>apps/web"]
+        Tg["Telegram Bot Adapter<br/>packages/adapters/telegram_bot.py"]
+    end
+
+    subgraph API["API Layer"]
+        FastAPI["FastAPI App<br/>apps/api/main.py"]
+        Routers["Routers<br/>system / market / trading / ai / auth"]
+        Security["Auth + RBAC + Security Headers"]
+    end
+
+    subgraph Core["Core Domain Layer (packages/core)"]
+        Scheduler["Scheduler"]
+        Cycle["Trading Cycle Service"]
+        Strategies["Strategy Engine"]
+        Risk["Risk Engine"]
+        ExecPaper["Paper Engine"]
+        ExecLive["Live Engine (gated)"]
+        AIAdvisor["AI Advisor"]
+        Approval["Approval Gate"]
+        Metrics["Metrics Calculator"]
+        State["System State Manager"]
+        Audit["Audit Logger"]
+    end
+
+    subgraph Adapters["External Adapters (packages/adapters)"]
+        BinanceSpot["Binance Spot Adapter"]
+        BinanceLive["Binance Live Adapter"]
+    end
+
+    subgraph Data["Storage"]
+        SQLite["SQLite<br/>orders / fills / positions / approvals / events / metrics"]
+    end
+
+    Web --> FastAPI
+    Tg --> FastAPI
+    FastAPI --> Routers
+    Routers --> Security
+    Routers --> Scheduler
+    Routers --> Cycle
+    Routers --> AIAdvisor
+    Routers --> Approval
+    Routers --> State
+
+    Scheduler --> Cycle
+    Scheduler --> Approval
+    Cycle --> Strategies
+    Cycle --> Risk
+    Cycle --> ExecPaper
+    Cycle --> ExecLive
+    Cycle --> Metrics
+    Cycle --> Audit
+
+    AIAdvisor --> Approval
+    Approval --> State
+    State --> Scheduler
+
+    ExecPaper --> SQLite
+    ExecLive --> SQLite
+    Metrics --> SQLite
+    Audit --> SQLite
+    Approval --> SQLite
+    Scheduler --> SQLite
+
+    BinanceSpot --> Cycle
+    BinanceSpot --> Routers
+    BinanceLive --> ExecLive
+

@@ -9,6 +9,22 @@ Production-oriented local trading platform with strict safety controls:
 - Full audit trail in SQLite
 - Local web dashboard for ops/control
 
+## Documentation
+
+- Full docs index: `docs/README.md`
+- User guide: `docs/USER_GUIDE.md`
+- How it works: `docs/HOW_IT_WORKS.md`
+- Sequence diagrams: `docs/SEQUENCE_DIAGRAMS.md`
+- Architecture diagram asset: `docs/ARCHITECTURE.png`
+- API + RBAC reference: `docs/API_RBAC_REFERENCE.md`
+- API examples: `docs/API_EXAMPLES.md`
+- Postman collection: `docs/postman/Trading-Bot.postman_collection.json`
+- Postman local environment: `docs/postman/Trading-Bot.local.postman_environment.json`
+- Code reference: `docs/CODE_REFERENCE.md`
+- Onboarding checklist: `docs/ONBOARDING_CHECKLIST.md`
+- Operator quickstart: `docs/OPERATOR_QUICKSTART.md`
+- Operations runbook: `docs/OPERATIONS_RUNBOOK.md`
+
 ## Architecture
 
 ### Backend (`apps/api`)
