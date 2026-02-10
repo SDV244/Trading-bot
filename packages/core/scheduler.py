@@ -205,11 +205,13 @@ class TradingScheduler:
                         if not pending:
                             proposals = await get_ai_advisor().generate_proposals(session)
                             if proposals:
-                                created = await get_approval_gate().create_approval(session, proposals[0])
-                                if created.status == "APPROVED":
-                                    increment_approval("auto_approved")
-                                else:
-                                    increment_approval("created")
+                                max_to_enqueue = max(1, min(len(proposals), get_settings().multiagent.max_proposals))
+                                for proposal in proposals[:max_to_enqueue]:
+                                    created = await get_approval_gate().create_approval(session, proposal)
+                                    if created.status == "APPROVED":
+                                        increment_approval("auto_approved")
+                                    else:
+                                        increment_approval("created")
 
                 self._last_result = self._serialize_result(
                     result,
@@ -344,11 +346,13 @@ class TradingScheduler:
     async def _build_trade_summary_window(self, window_hours: int) -> tuple[str, dict[str, str | int]]:
         now = datetime.now(UTC)
         window_start = now - timedelta(hours=window_hours)
+        is_paper_mode = not get_settings().trading.live_mode
+        mode_label = "paper" if is_paper_mode else "live"
         async with get_session() as session:
             fills_count = (
                 await session.execute(
                     select(func.count(Fill.id)).where(
-                        Fill.is_paper.is_(True),
+                        Fill.is_paper.is_(is_paper_mode),
                         Fill.filled_at >= window_start,
                     )
                 )
@@ -358,7 +362,7 @@ class TradingScheduler:
                     select(func.count(Fill.id))
                     .join(Order, Fill.order_id == Order.id)
                     .where(
-                        Fill.is_paper.is_(True),
+                        Fill.is_paper.is_(is_paper_mode),
                         Fill.filled_at >= window_start,
                         Order.side == "BUY",
                     )
@@ -369,7 +373,7 @@ class TradingScheduler:
                     select(func.count(Fill.id))
                     .join(Order, Fill.order_id == Order.id)
                     .where(
-                        Fill.is_paper.is_(True),
+                        Fill.is_paper.is_(is_paper_mode),
                         Fill.filled_at >= window_start,
                         Order.side == "SELL",
                     )
@@ -378,7 +382,7 @@ class TradingScheduler:
             traded_notional_raw = (
                 await session.execute(
                     select(func.coalesce(func.sum(Fill.quantity * Fill.price), 0)).where(
-                        Fill.is_paper.is_(True),
+                        Fill.is_paper.is_(is_paper_mode),
                         Fill.filled_at >= window_start,
                     )
                 )
@@ -386,7 +390,7 @@ class TradingScheduler:
             fees_paid_raw = (
                 await session.execute(
                     select(func.coalesce(func.sum(Fill.fee), 0)).where(
-                        Fill.is_paper.is_(True),
+                        Fill.is_paper.is_(is_paper_mode),
                         Fill.filled_at >= window_start,
                     )
                 )
@@ -395,14 +399,14 @@ class TradingScheduler:
                 await session.execute(
                     select(Position).where(
                         Position.symbol == get_trading_cycle_service().symbol,
-                        Position.is_paper.is_(True),
+                        Position.is_paper.is_(is_paper_mode),
                     )
                 )
             ).scalar_one_or_none()
             equity_snapshot = (
                 await session.execute(
                     select(EquitySnapshot)
-                    .where(EquitySnapshot.is_paper.is_(True))
+                    .where(EquitySnapshot.is_paper.is_(is_paper_mode))
                     .order_by(EquitySnapshot.snapshot_at.desc())
                     .limit(1)
                 )
@@ -421,6 +425,7 @@ class TradingScheduler:
         window_text = f"{window_start.strftime('%Y-%m-%d %H:%MZ')} -> {now.strftime('%Y-%m-%d %H:%MZ')}"
         summary_text = (
             f"Window: {window_text}\n"
+            f"Mode: {mode_label}\n"
             f"Symbol: {get_trading_cycle_service().symbol}\n"
             f"Fills: {fills_count} (BUY {buy_count} | SELL {sell_count})\n"
             f"Traded notional: {self._fmt_decimal(traded_notional, 2)} USDT\n"

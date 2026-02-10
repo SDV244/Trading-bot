@@ -8,7 +8,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from apps.api.security.auth import AuthUser, require_min_role
-from packages.core.ai import ApprovalGateError, get_ai_advisor, get_approval_gate
+from packages.core.ai import (
+    ApprovalGateError,
+    get_ai_advisor,
+    get_approval_gate,
+    get_emergency_stop_analyzer,
+)
 from packages.core.audit import log_event
 from packages.core.config import AuthRole, apply_runtime_config_patch, get_settings
 from packages.core.database.models import Approval, EquitySnapshot, EventLog
@@ -124,6 +129,68 @@ class LLMTestResponse(BaseModel):
     raw_proposals_count: int | None = None
 
 
+class MultiAgentStatusResponse(BaseModel):
+    """Multi-agent advisor runtime status."""
+
+    enabled: bool
+    max_proposals: int
+    min_confidence: float
+    meta_agent_enabled: bool
+    strategy_agent_enabled: bool
+    risk_agent_enabled: bool
+    market_agent_enabled: bool
+    execution_agent_enabled: bool
+    sentiment_agent_enabled: bool
+
+
+class MultiAgentTestResponse(BaseModel):
+    """Multi-agent dry-run test result."""
+
+    ok: bool
+    enabled: bool
+    message: str
+    agents_used: list[str]
+    proposal_count: int
+
+
+class EmergencyAnalyzeRequest(BaseModel):
+    """Request payload for emergency incident analysis."""
+
+    reason: str | None = Field(default=None, max_length=300)
+    source: str = Field(default="manual_emergency_analysis", min_length=3, max_length=80)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    force: bool = Field(
+        default=False,
+        description="Run even if APPROVAL_EMERGENCY_AI_ENABLED is disabled",
+    )
+
+
+class EmergencyAnalyzeResponse(BaseModel):
+    """Emergency analysis execution response."""
+
+    triggered: bool
+    source: str
+    reason: str
+    used_llm: bool
+    llm_error: str | None
+    proposals_generated: int
+    approvals_created: int
+    approvals_auto_approved: int
+    proposal_titles: list[str]
+    approval_ids: list[int]
+
+
+class EmergencyAnalysisStatusResponse(BaseModel):
+    """Last emergency analysis audit event response."""
+
+    found: bool
+    event_type: str | None
+    summary: str | None
+    details: dict[str, Any] | None
+    created_at: datetime | None
+    actor: str | None
+
+
 def _to_approval_response(approval: Approval) -> ApprovalResponse:
     return ApprovalResponse(
         id=approval.id,
@@ -183,6 +250,24 @@ async def test_llm_connection(
     return LLMTestResponse(**result)
 
 
+@router.get("/multi-agent/status", response_model=MultiAgentStatusResponse)
+async def get_multiagent_status(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> MultiAgentStatusResponse:
+    """Get current multi-agent orchestration status."""
+    status = get_ai_advisor().multiagent_status()
+    return MultiAgentStatusResponse(**status)
+
+
+@router.post("/multi-agent/test", response_model=MultiAgentTestResponse)
+async def test_multiagent_connection(
+    _: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> MultiAgentTestResponse:
+    """Run lightweight multi-agent dry-run using synthetic context."""
+    result = await get_ai_advisor().test_multiagent_connection()
+    return MultiAgentTestResponse(**result)
+
+
 @router.get("/auto-approve", response_model=AutoApproveStatusResponse)
 async def get_auto_approve_status(
     _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
@@ -233,6 +318,82 @@ async def set_auto_approve_status(
     return AutoApproveStatusResponse(
         enabled=settings.approval.auto_approve_enabled,
         decided_by="ai_auto_approver",
+    )
+
+
+@router.post("/emergency/analyze-now", response_model=EmergencyAnalyzeResponse)
+async def analyze_emergency_now(
+    request: EmergencyAnalyzeRequest,
+    user: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> EmergencyAnalyzeResponse:
+    """Trigger emergency-stop AI analysis immediately."""
+    await init_database()
+    reason = (request.reason or "").strip()
+    if not reason:
+        from packages.core.state import get_state_manager
+
+        reason = get_state_manager().current.reason or "manual_emergency_analysis"
+
+    async with get_session() as session:
+        outcome = await get_emergency_stop_analyzer().analyze_and_enqueue(
+            session,
+            reason=reason,
+            source=request.source,
+            metadata=request.metadata,
+            actor=user.username,
+            force=request.force,
+        )
+    return EmergencyAnalyzeResponse(
+        triggered=outcome.triggered,
+        source=outcome.source,
+        reason=outcome.reason,
+        used_llm=outcome.used_llm,
+        llm_error=outcome.llm_error,
+        proposals_generated=outcome.proposals_generated,
+        approvals_created=outcome.approvals_created,
+        approvals_auto_approved=outcome.approvals_auto_approved,
+        proposal_titles=list(outcome.proposal_titles),
+        approval_ids=list(outcome.approval_ids),
+    )
+
+
+@router.get("/emergency/last-analysis", response_model=EmergencyAnalysisStatusResponse)
+async def get_last_emergency_analysis(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> EmergencyAnalysisStatusResponse:
+    """Get the latest emergency AI analysis event (success or failure)."""
+    await init_database()
+    async with get_session() as session:
+        result = await session.execute(
+            select(EventLog)
+            .where(
+                EventLog.event_type.in_(
+                    [
+                        "emergency_ai_analysis_completed",
+                        "emergency_ai_analysis_failed",
+                    ]
+                )
+            )
+            .order_by(EventLog.created_at.desc())
+            .limit(1)
+        )
+        event = result.scalars().first()
+    if event is None:
+        return EmergencyAnalysisStatusResponse(
+            found=False,
+            event_type=None,
+            summary=None,
+            details=None,
+            created_at=None,
+            actor=None,
+        )
+    return EmergencyAnalysisStatusResponse(
+        found=True,
+        event_type=event.event_type,
+        summary=event.summary,
+        details=event.details,
+        created_at=event.created_at,
+        actor=event.actor,
     )
 
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Literal
 
+from packages.core.market_regime import MarketRegime
 from packages.core.strategies.base import Signal
 
 RiskAction = Literal["ALLOW", "HOLD", "REJECT"]
@@ -14,12 +15,24 @@ class RiskConfig:
     """Risk engine parameters."""
 
     risk_per_trade: Decimal = Decimal("0.005")
+    min_risk_per_trade: Decimal = Decimal("0.0")
+    max_risk_per_trade: Decimal = Decimal("0.020")
     max_daily_loss: Decimal = Decimal("0.02")
     max_exposure: Decimal = Decimal("0.25")
     fee_bps: int = 10
     slippage_bps: int = 5
     min_notional: Decimal = Decimal("10")
     lot_step_size: Decimal = Decimal("0.00001")
+    dynamic_sizing_enabled: bool = True
+    confidence_sizing_enabled: bool = True
+    regime_sizing_enabled: bool = True
+    drawdown_scaling_enabled: bool = True
+    drawdown_tier1_pct: Decimal = Decimal("0.05")
+    drawdown_tier1_mult: Decimal = Decimal("0.80")
+    drawdown_tier2_pct: Decimal = Decimal("0.10")
+    drawdown_tier2_mult: Decimal = Decimal("0.50")
+    drawdown_tier3_pct: Decimal = Decimal("0.15")
+    drawdown_tier3_mult: Decimal = Decimal("0.20")
 
 
 @dataclass(slots=True, frozen=True)
@@ -30,6 +43,7 @@ class RiskInput:
     daily_realized_pnl: Decimal
     current_exposure_notional: Decimal
     price: Decimal
+    peak_equity: Decimal | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -72,7 +86,8 @@ class RiskEngine:
         if is_sell and risk_input.current_exposure_notional <= 0:
             return self._hold("no_exposure_to_reduce")
 
-        risk_budget_notional = self.config.risk_per_trade * risk_input.equity
+        risk_per_trade = self._resolve_adjusted_risk(signal, risk_input)
+        risk_budget_notional = risk_per_trade * risk_input.equity
         if is_sell:
             # SELL orders reduce exposure and should not be blocked by max_exposure
             # guard. Cap size by current exposure when known.
@@ -119,6 +134,69 @@ class RiskEngine:
             return False
         daily_loss = abs(risk_input.daily_realized_pnl)
         return (daily_loss / risk_input.equity) >= self.config.max_daily_loss
+
+    def _resolve_adjusted_risk(self, signal: Signal, risk_input: RiskInput) -> Decimal:
+        risk = self.config.risk_per_trade
+        if not self.config.dynamic_sizing_enabled:
+            return self._clamp_risk(risk)
+
+        if self.config.confidence_sizing_enabled:
+            confidence_multiplier = Decimal("0.5") + (Decimal(str(signal.confidence)) * Decimal("0.7"))
+            risk *= confidence_multiplier
+
+        if self.config.regime_sizing_enabled:
+            regime_multiplier = self._regime_multiplier(signal)
+            risk *= regime_multiplier
+
+        if self.config.drawdown_scaling_enabled:
+            risk *= self._drawdown_multiplier(risk_input)
+
+        return self._clamp_risk(risk)
+
+    def _clamp_risk(self, value: Decimal) -> Decimal:
+        lower = min(self.config.min_risk_per_trade, self.config.max_risk_per_trade)
+        upper = max(self.config.min_risk_per_trade, self.config.max_risk_per_trade)
+        return min(upper, max(lower, value))
+
+    def _regime_multiplier(self, signal: Signal) -> Decimal:
+        regime_label = signal.indicators.get("regime")
+        if isinstance(regime_label, str):
+            try:
+                regime = MarketRegime(regime_label.strip().lower())
+            except Exception:
+                regime = MarketRegime.UNKNOWN
+        else:
+            regime_code = signal.indicators.get("regime_code")
+            try:
+                regime = MarketRegime.from_code(float(regime_code) if regime_code is not None else 0)
+            except Exception:
+                regime = MarketRegime.UNKNOWN
+
+        multiplier = {
+            MarketRegime.TRENDING_BULLISH: Decimal("0.85"),
+            MarketRegime.TRENDING_BEARISH: Decimal("0.85"),
+            MarketRegime.RANGING_TIGHT: Decimal("1.15"),
+            MarketRegime.RANGING_WIDE: Decimal("0.95"),
+            MarketRegime.BREAKOUT_PENDING: Decimal("0.65"),
+            MarketRegime.VOLATILE_CHAOS: Decimal("0.50"),
+            MarketRegime.UNKNOWN: Decimal("1.00"),
+        }.get(regime, Decimal("1.00"))
+        return multiplier
+
+    def _drawdown_multiplier(self, risk_input: RiskInput) -> Decimal:
+        peak = risk_input.peak_equity
+        if peak is None or peak <= 0 or risk_input.equity <= 0:
+            return Decimal("1.0")
+        if risk_input.equity >= peak:
+            return Decimal("1.0")
+        drawdown = (peak - risk_input.equity) / peak
+        if drawdown >= self.config.drawdown_tier3_pct:
+            return self.config.drawdown_tier3_mult
+        if drawdown >= self.config.drawdown_tier2_pct:
+            return self.config.drawdown_tier2_mult
+        if drawdown >= self.config.drawdown_tier1_pct:
+            return self.config.drawdown_tier1_mult
+        return Decimal("1.0")
 
     @staticmethod
     def _hold(reason: str) -> RiskDecision:

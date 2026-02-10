@@ -114,3 +114,59 @@ def test_reject_below_min_notional() -> None:
     )
     assert decision.action == "REJECT"
     assert decision.reason == "below_min_notional"
+
+
+def test_dynamic_sizing_reduces_risk_in_volatile_chaos() -> None:
+    engine = RiskEngine(
+        RiskConfig(
+            risk_per_trade=Decimal("0.01"),
+            dynamic_sizing_enabled=True,
+            regime_sizing_enabled=True,
+            confidence_sizing_enabled=False,
+            drawdown_scaling_enabled=False,
+        )
+    )
+    decision = engine.evaluate(
+        Signal(
+            side="BUY",
+            confidence=0.8,
+            reason="test",
+            indicators={"regime_code": 6.0},  # volatile_chaos
+        ),
+        RiskInput(
+            equity=Decimal("10000"),
+            daily_realized_pnl=Decimal("0"),
+            current_exposure_notional=Decimal("0"),
+            price=Decimal("50000"),
+        ),
+    )
+    assert decision.action == "ALLOW"
+    # 0.01 * 0.5 = 0.005 risk budget => 50 USDT notional => ~0.001 BTC
+    assert decision.notional <= Decimal("55")
+
+
+def test_dynamic_sizing_reduces_risk_on_drawdown_tier() -> None:
+    engine = RiskEngine(
+        RiskConfig(
+            risk_per_trade=Decimal("0.01"),
+            dynamic_sizing_enabled=True,
+            confidence_sizing_enabled=False,
+            regime_sizing_enabled=False,
+            drawdown_scaling_enabled=True,
+            drawdown_tier2_pct=Decimal("0.10"),
+            drawdown_tier2_mult=Decimal("0.50"),
+        )
+    )
+    decision = engine.evaluate(
+        Signal(side="BUY", confidence=0.6, reason="test", indicators={}),
+        RiskInput(
+            equity=Decimal("9000"),
+            peak_equity=Decimal("10000"),
+            daily_realized_pnl=Decimal("0"),
+            current_exposure_notional=Decimal("0"),
+            price=Decimal("50000"),
+        ),
+    )
+    assert decision.action == "ALLOW"
+    # 10% drawdown tier should halve base risk budget.
+    assert decision.notional <= Decimal("50.1")

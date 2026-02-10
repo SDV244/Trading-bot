@@ -4,6 +4,7 @@ System State Endpoints
 Endpoints for managing system state (running, paused, emergency stop).
 """
 
+from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -14,6 +15,7 @@ from pydantic import BaseModel, Field
 from apps.api.security.auth import AuthUser, require_min_role
 from packages.adapters.telegram_bot import get_telegram_notifier
 from packages.adapters.webhook_notifier import get_webhook_notifier
+from packages.core.ai import get_emergency_stop_analyzer
 from packages.core.audit import log_event
 from packages.core.config import AuthRole, get_settings, reload_settings
 from packages.core.database.session import get_session, init_database
@@ -224,6 +226,18 @@ async def change_state(
             },
             actor=actor,
         )
+        if request.action == "emergency_stop":
+            with suppress(Exception):
+                await get_emergency_stop_analyzer().analyze_and_enqueue(
+                    session,
+                    reason=request.reason,
+                    source="system_state_transition",
+                    metadata={
+                        "requested_changed_by": request.changed_by,
+                        "changed_by": actor,
+                    },
+                    actor=actor,
+                )
     increment_system_state(current.state.value)
     await get_telegram_notifier().send_info(
         "System state changed",
@@ -267,6 +281,14 @@ async def emergency_stop(
             },
             actor=actor,
         )
+        with suppress(Exception):
+            await get_emergency_stop_analyzer().analyze_and_enqueue(
+                session,
+                reason=request.reason,
+                source="system_emergency_endpoint",
+                metadata={"requested_changed_by": request.changed_by, "changed_by": actor},
+                actor=actor,
+            )
     increment_system_state(current.state.value)
     await get_telegram_notifier().send_critical_alert(
         "Emergency stop triggered",

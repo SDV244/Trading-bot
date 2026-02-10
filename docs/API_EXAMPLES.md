@@ -303,6 +303,20 @@ curl -s -X POST http://127.0.0.1:8000/api/ai/llm/test \
   -H "Authorization: Bearer $TOKEN"
 ```
 
+Multi-agent status:
+
+```bash
+curl -s http://127.0.0.1:8000/api/ai/multi-agent/status \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Multi-agent dry-run test:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/ai/multi-agent/test \
+  -H "Authorization: Bearer $TOKEN"
+```
+
 List approvals:
 
 ```bash

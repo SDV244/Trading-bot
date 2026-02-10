@@ -280,6 +280,20 @@ class ApprovalGate:
             details={"expired_approvals": [a.id for a in expired]},
             actor="approval_gate",
         )
+        try:
+            from packages.core.ai.emergency_analyzer import get_emergency_stop_analyzer
+
+            await get_emergency_stop_analyzer().analyze_and_enqueue(
+                session,
+                reason=f"Approval timeout ({len(expired)} expired)",
+                source="approval_gate",
+                metadata={"expired_approvals": [a.id for a in expired]},
+                actor="approval_gate",
+                gate=self,
+            )
+        except Exception:  # noqa: BLE001
+            # Expiry safety behavior must continue even if AI analysis fails.
+            pass
 
         notifier = get_telegram_notifier()
         await notifier.send_critical_alert(

@@ -11,7 +11,7 @@ import packages.core.state as state_module
 from packages.core.ai import AIAdvisor, ApprovalGate
 from packages.core.ai.advisor import AIProposal
 from packages.core.config import get_settings, reload_settings
-from packages.core.database.models import Approval, Base, Config, MetricsSnapshot
+from packages.core.database.models import Approval, Base, Config, EventLog, MetricsSnapshot
 
 
 @pytest.fixture
@@ -150,6 +150,41 @@ async def test_approval_expiry_triggers_emergency_stop(db_session: AsyncSession)
     approval_result = await db_session.execute(select(Approval).where(Approval.id == created.id))
     stored = approval_result.scalar_one()
     assert stored.status == "EXPIRED"
+
+
+@pytest.mark.asyncio
+async def test_approval_expiry_triggers_emergency_ai_analysis(db_session: AsyncSession) -> None:
+    gate = ApprovalGate()
+    created = await gate.create_approval(
+        db_session,
+        AIProposal(
+            title="Expired proposal with AI follow-up",
+            proposal_type="risk_tuning",
+            description="Expire me",
+            diff={"risk": {"per_trade": 0.0025}},
+            expected_impact="n/a",
+            evidence={},
+            confidence=0.7,
+            ttl_hours=1,
+        ),
+    )
+    created.expires_at = datetime.now(UTC) - timedelta(minutes=1)
+    await db_session.flush()
+
+    expired = await gate.expire_pending(db_session)
+    assert len(expired) == 1
+
+    event_result = await db_session.execute(
+        select(EventLog).where(EventLog.event_type == "emergency_ai_analysis_completed")
+    )
+    analysis_event = event_result.scalars().first()
+    assert analysis_event is not None
+
+    approvals = await gate.list_approvals(db_session, limit=50)
+    assert any(
+        approval.id != created.id and approval.proposal_type in {"emergency_remediation", "risk_tuning"}
+        for approval in approvals
+    )
 
 
 @pytest.mark.asyncio
@@ -322,4 +357,59 @@ async def test_advisor_llm_fallback_to_rules_when_llm_empty(
     proposals = await advisor.generate_proposals(db_session)
 
     assert any(p.proposal_type == "risk_tuning" for p in proposals)
+    reload_settings()
+
+
+@pytest.mark.asyncio
+async def test_advisor_prefers_multiagent_when_enabled(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    monkeypatch.setenv("LLM_MODEL", "llama3.1:8b")
+    monkeypatch.setenv("LLM_PREFER_LLM", "true")
+    monkeypatch.setenv("LLM_FALLBACK_TO_RULES", "true")
+    monkeypatch.setenv("MULTIAGENT_ENABLED", "true")
+    reload_settings()
+
+    db_session.add(
+        MetricsSnapshot(
+            strategy_name="smart_grid_ai",
+            total_trades=180,
+            winning_trades=100,
+            losing_trades=80,
+            total_pnl=Decimal("44"),
+            total_fees=Decimal("22"),
+            max_drawdown=0.05,
+            sharpe_ratio=0.9,
+            sortino_ratio=1.2,
+            profit_factor=1.25,
+            win_rate=0.55,
+            avg_trade_pnl=Decimal("0.2"),
+            is_paper=True,
+        )
+    )
+    await db_session.flush()
+
+    advisor = AIAdvisor()
+
+    async def fake_multi(*_args, **_kwargs):
+        return [
+            AIProposal(
+                title="[strategy_agent] Multi-agent tune",
+                proposal_type="grid_tuning",
+                description="Agent consensus recommends spacing update.",
+                diff={"trading": {"grid_min_spacing_bps": 42, "grid_max_spacing_bps": 260}},
+                expected_impact="Reduce churn.",
+                evidence={"source": "multiagent_test"},
+                confidence=0.81,
+            )
+        ]
+
+    monkeypatch.setattr(advisor, "_multi_agent_proposals", fake_multi)
+    proposals = await advisor.generate_proposals(db_session)
+    assert len(proposals) == 1
+    assert "Multi-agent tune" in proposals[0].title
+    assert proposals[0].diff["trading"]["grid_min_spacing_bps"] == 42
     reload_settings()

@@ -5,16 +5,28 @@ from typing import Any
 
 from packages.core.ai.advisor import AIAdvisor, AIProposal, get_ai_advisor
 from packages.core.ai.approval_gate import ApprovalGate, ApprovalGateError, get_approval_gate
+from packages.core.ai.emergency_analyzer import (
+    EmergencyAnalysisOutcome,
+    EmergencyStopAnalyzer,
+    get_emergency_stop_analyzer,
+)
+from packages.core.ai.multi_agent import AgentProposal as MultiAgentProposal
+from packages.core.ai.multi_agent import MultiAgentCoordinator
 
 __all__ = [
     "AIAdvisor",
     "AIProposal",
+    "MultiAgentCoordinator",
+    "MultiAgentProposal",
     "ApprovalGate",
     "ApprovalGateError",
+    "EmergencyStopAnalyzer",
+    "EmergencyAnalysisOutcome",
     "DRLOptimizer",
     "DRLProposal",
     "get_ai_advisor",
     "get_approval_gate",
+    "get_emergency_stop_analyzer",
 ]
 
 

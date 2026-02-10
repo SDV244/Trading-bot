@@ -91,6 +91,8 @@ Auth requirement:
 - `POST /api/ai/proposals/generate` (`operator+`)
 - `GET /api/ai/llm/status` (`viewer+`)
 - `POST /api/ai/llm/test` (`operator+`)
+- `GET /api/ai/multi-agent/status` (`viewer+`)
+- `POST /api/ai/multi-agent/test` (`operator+`)
 - `GET /api/ai/approvals` (`viewer+`)
 - `POST /api/ai/approvals/{id}/approve` (`operator+`)
 - `POST /api/ai/approvals/{id}/reject` (`operator+`)

@@ -3,7 +3,9 @@
 from dataclasses import dataclass
 from decimal import Decimal
 from statistics import pstdev
+from typing import Any
 
+from packages.core.market_regime import MarketRegimeDetector
 from packages.core.strategies.base import Signal, Strategy, StrategyContext, registry
 
 
@@ -51,6 +53,18 @@ class SmartAdaptiveGridStrategy(Strategy):
     regime_fast_period_4h: int = 21
     regime_slow_period_4h: int = 55
     recenter_mode: str = "aggressive"
+    regime_adaptation_enabled: bool = False
+
+    def __post_init__(self) -> None:
+        self._regime_detector = MarketRegimeDetector()
+
+    def _calculate_dynamic_spacing(self, volatility_percentile: float) -> tuple[int, int]:
+        """Adapt spacing guardrails using volatility percentile regime."""
+        if volatility_percentile < 0.30:
+            return max(10, self.min_spacing_bps - 10), max(self.min_spacing_bps + 20, self.max_spacing_bps - 70)
+        if volatility_percentile < 0.70:
+            return self.min_spacing_bps, self.max_spacing_bps
+        return max(20, self.min_spacing_bps + 15), min(800, self.max_spacing_bps + 130)
 
     def data_requirements(self) -> dict[str, int]:
         return {
@@ -104,11 +118,32 @@ class SmartAdaptiveGridStrategy(Strategy):
         vol = pstdev(returns[-vol_window:]) if len(returns) >= 2 else 0.0
         vol_bps = Decimal(str(vol * 10000))
 
+        regime_analysis = self._regime_detector.detect_regime(
+            closes=closes_1h,
+            volumes=[c.volume for c in context.candles_1h],
+            highs=highs_1h,
+            lows=lows_1h,
+        )
+        dynamic_min_spacing, dynamic_max_spacing = self._calculate_dynamic_spacing(
+            regime_analysis.volatility_percentile
+        )
+        adaptation = self._regime_detector.recommended_adaptation(
+            analysis=regime_analysis,
+            base_grid_levels=self.grid_levels,
+            base_take_profit_buffer=self.take_profit_buffer,
+            base_stop_loss_buffer=self.stop_loss_buffer,
+        )
+        effective_min_spacing = dynamic_min_spacing
+        effective_max_spacing = dynamic_max_spacing
+        if self.regime_adaptation_enabled:
+            effective_min_spacing = int(max(10, effective_min_spacing * adaptation.spacing_multiplier))
+            effective_max_spacing = int(max(effective_min_spacing + 10, effective_max_spacing * adaptation.spacing_multiplier))
+
         raw_spacing = (atr_bps * Decimal(str(self.volatility_blend))) + (vol_bps * Decimal("0.50"))
         spacing_bps = int(
             max(
-                Decimal(self.min_spacing_bps),
-                min(Decimal(self.max_spacing_bps), raw_spacing),
+                Decimal(effective_min_spacing),
+                min(Decimal(effective_max_spacing), raw_spacing),
             )
         )
         spacing_bps = max(spacing_bps, 1)
@@ -120,10 +155,12 @@ class SmartAdaptiveGridStrategy(Strategy):
         regime_strength = (regime_fast - regime_slow) / regime_slow
 
         tilt_multiplier = Decimal("1") + (regime_strength * Decimal(str(self.trend_tilt)))
+        if self.regime_adaptation_enabled:
+            tilt_multiplier *= Decimal(str(adaptation.tilt_multiplier))
         tilted_center = center_ema * tilt_multiplier
 
-        min_step = tilted_center * Decimal(self.min_spacing_bps) / Decimal("10000")
-        max_step = tilted_center * Decimal(self.max_spacing_bps) / Decimal("10000")
+        min_step = tilted_center * Decimal(effective_min_spacing) / Decimal("10000")
+        max_step = tilted_center * Decimal(effective_max_spacing) / Decimal("10000")
         geometric_step = tilted_center * Decimal(spacing_bps) / Decimal("10000")
         vol_abs = tilted_center * vol_bps / Decimal("10000")
         arithmetic_raw_step = (atr_value * Decimal(str(self.volatility_blend))) + (vol_abs * Decimal("0.50"))
@@ -132,7 +169,8 @@ class SmartAdaptiveGridStrategy(Strategy):
         if step <= 0:
             return Signal(side="HOLD", confidence=0.0, reason="invalid_grid_step", indicators={})
 
-        levels_each_side = max(1, self.grid_levels // 2)
+        effective_grid_levels = adaptation.grid_levels if self.regime_adaptation_enabled else self.grid_levels
+        levels_each_side = max(1, effective_grid_levels // 2)
         half_levels = Decimal(str(levels_each_side))
         upper_band = tilted_center + (step * half_levels)
         lower_band = tilted_center - (step * half_levels)
@@ -143,16 +181,24 @@ class SmartAdaptiveGridStrategy(Strategy):
         max_distance = max(step * half_levels, Decimal("0.00000001"))
         confidence = float(min(Decimal("0.95"), distance_to_center / max_distance))
 
-        indicators = {
+        indicators: dict[str, Any] = {
             "grid_center": float(tilted_center),
             "grid_upper": float(upper_band),
             "grid_lower": float(lower_band),
             "grid_step": float(step),
-            "grid_levels": float(self.grid_levels),
+            "grid_levels": float(effective_grid_levels),
             "spacing_bps": float(spacing_bps),
             "spacing_mode_geometric": 1.0 if spacing_mode == "geometric" else 0.0,
             "atr_bps": float(atr_bps),
             "vol_bps": float(vol_bps),
+            "volatility_percentile": float(regime_analysis.volatility_percentile),
+            "regime_code": float(regime_analysis.regime.code),
+            "regime_confidence": float(regime_analysis.confidence),
+            "regime_trend_strength": float(regime_analysis.trend_strength),
+            "regime_breakout_probability": float(regime_analysis.breakout_probability),
+            "position_size_multiplier": float(adaptation.position_size_multiplier),
+            "effective_min_spacing_bps": float(effective_min_spacing),
+            "effective_max_spacing_bps": float(effective_max_spacing),
             "regime_strength": float(regime_strength),
             "last_close": float(last_close),
             "prev_close": float(prev_close),
@@ -164,8 +210,14 @@ class SmartAdaptiveGridStrategy(Strategy):
             indicators[f"grid_buy_level_{level}"] = float(tilted_center - (step * Decimal(level)))
             indicators[f"grid_sell_level_{level}"] = float(tilted_center + (step * Decimal(level)))
 
-        if self.take_profit_buffer > 0:
-            take_profit_trigger = upper_band * (Decimal("1") + Decimal(str(self.take_profit_buffer)))
+        effective_take_profit_buffer = (
+            adaptation.take_profit_buffer if self.regime_adaptation_enabled else self.take_profit_buffer
+        )
+        effective_stop_loss_buffer = (
+            adaptation.stop_loss_buffer if self.regime_adaptation_enabled else self.stop_loss_buffer
+        )
+        if effective_take_profit_buffer > 0:
+            take_profit_trigger = upper_band * (Decimal("1") + Decimal(str(effective_take_profit_buffer)))
             indicators["take_profit_trigger"] = float(take_profit_trigger)
             if last_close >= take_profit_trigger:
                 return Signal(
@@ -174,8 +226,8 @@ class SmartAdaptiveGridStrategy(Strategy):
                     reason="grid_take_profit_buffer_hit",
                     indicators=indicators,
                 )
-        if self.stop_loss_buffer > 0:
-            stop_loss_trigger = lower_band * (Decimal("1") - Decimal(str(self.stop_loss_buffer)))
+        if effective_stop_loss_buffer > 0:
+            stop_loss_trigger = lower_band * (Decimal("1") - Decimal(str(effective_stop_loss_buffer)))
             indicators["stop_loss_trigger"] = float(stop_loss_trigger)
             if last_close <= stop_loss_trigger:
                 return Signal(

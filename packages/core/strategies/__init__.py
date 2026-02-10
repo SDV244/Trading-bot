@@ -2,6 +2,7 @@
 
 from packages.core.strategies.base import CandleInput, Signal, Strategy, StrategyContext, registry
 from packages.core.strategies.breakout import BreakoutStrategy
+from packages.core.strategies.enhanced_smart_grid import EnhancedSmartGridStrategy
 from packages.core.strategies.mean_reversion import MeanReversionStrategy
 from packages.core.strategies.smart_grid import SmartAdaptiveGridStrategy
 from packages.core.strategies.trend import EMATrendFastStrategy, EMATrendStrategy
@@ -9,6 +10,7 @@ from packages.core.strategies.trend import EMATrendFastStrategy, EMATrendStrateg
 __all__ = [
     "BreakoutStrategy",
     "CandleInput",
+    "EnhancedSmartGridStrategy",
     "EMATrendStrategy",
     "EMATrendFastStrategy",
     "MeanReversionStrategy",

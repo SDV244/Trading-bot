@@ -9,7 +9,8 @@ export function TradingPage() {
   const reconciliation = lastResult?.reconciliation ?? null;
   const gridPreview = data.gridPreview;
   const symbol = data.position?.symbol ?? data.config?.trading_pair ?? "BTCUSDT";
-  const baseAsset = symbol.endsWith("USDT") ? symbol.replace("USDT", "") : symbol;
+  const baseAsset = data.funds?.base_asset ?? (symbol.endsWith("USDT") ? symbol.replace("USDT", "") : symbol);
+  const quoteAsset = data.funds?.quote_asset ?? "USDT";
   const nextGridHint = useMemo(() => {
     if (!gridPreview) {
       return null;
@@ -52,6 +53,34 @@ export function TradingPage() {
 
   return (
     <section className="grid gap-4">
+      <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">
+        <h2 className="font-heading text-lg font-bold text-white">Wallet Funds</h2>
+        {data.funds ? (
+          <div className="mt-3 grid gap-2 text-xs text-slate-200 md:grid-cols-3">
+            <p>
+              {baseAsset}: {formatNumber(data.funds.base_balance, 6)}
+            </p>
+            <p>
+              {quoteAsset}: {formatNumber(data.funds.quote_balance, 2)}
+            </p>
+            <p>
+              {baseAsset} Value ({quoteAsset}): {formatNumber(data.funds.base_quote_value, 2)}
+            </p>
+            <p>
+              Est. Total Equity: {formatNumber(data.funds.estimated_total_equity, 2)} {quoteAsset}
+            </p>
+            <p>
+              Mark Price: {formatNumber(data.funds.mark_price, 2)} {quoteAsset}
+            </p>
+            <p>Source: {data.funds.source}</p>
+          </div>
+        ) : (
+          <p className="mt-3 text-xs text-slate-400">
+            Funds are not available yet. Ensure API is running and, in live mode, exchange credentials are valid.
+          </p>
+        )}
+      </article>
+
       <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">
         <h2 className="font-heading text-lg font-bold text-white">Current Position</h2>
         <div className="mt-3 grid gap-2 text-xs text-slate-200 md:grid-cols-3">

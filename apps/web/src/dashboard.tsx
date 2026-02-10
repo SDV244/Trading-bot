@@ -6,6 +6,7 @@ import {
   type AuditEvent,
   type EquityPoint,
   type Fill,
+  type Funds,
   type GridPreview,
   type MarketCandle,
   type MarketPrice,
@@ -28,6 +29,7 @@ type DashboardData = {
   scheduler: SchedulerStatus | null;
   config: TradingConfig | null;
   position: Position | null;
+  funds: Funds | null;
   metrics: Metrics | null;
   orders: Order[];
   fills: Fill[];
@@ -61,6 +63,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     scheduler: null,
     config: null,
     position: null,
+    funds: null,
     metrics: null,
     orders: [],
     fills: [],
@@ -79,7 +82,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     try {
       const config = await api.getTradingConfig();
       const symbol = config.trading_pair;
-      const [health, ready, systemReadiness, system, scheduler, position, metrics, orders, fills, equity, approvals, events, marketCandles, marketPrice, gridPreview] =
+      const [health, ready, systemReadiness, system, scheduler, position, funds, metrics, orders, fills, equity, approvals, events, marketCandles, marketPrice, gridPreview] =
         await Promise.all([
           api.health(),
           api.ready(),
@@ -87,6 +90,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
           api.getSystemState(),
           api.getScheduler(),
           api.getPosition(),
+          api.getFunds().catch(() => null),
           api.getMetrics(),
           api.getOrders(8),
           api.getFills(8),
@@ -107,6 +111,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         scheduler,
         config,
         position,
+        funds,
         metrics,
         orders,
         fills,

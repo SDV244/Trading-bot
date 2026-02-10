@@ -238,6 +238,32 @@ class TradingSettings(BaseSettings):
         pattern="^(conservative|aggressive)$",
         description="Out-of-band recenter behavior: conservative (wait) or aggressive (breakout/breakdown action)",
     )
+    regime_adaptation_enabled: bool = Field(
+        default=True,
+        description="Enable regime-aware adaptation inside smart-grid strategy",
+    )
+    inventory_profit_levels: str = Field(
+        default="0.015:0.25,0.025:0.50,0.040:1.0",
+        description="Profit lock ladder as return:fraction pairs",
+    )
+    inventory_trailing_stop_pct: float = Field(
+        default=0.02,
+        ge=0.0,
+        le=0.5,
+        description="Trailing stop threshold after first profit lock level is reached",
+    )
+    inventory_time_stop_hours: int = Field(
+        default=48,
+        ge=1,
+        le=24 * 30,
+        description="Force-reduce stale positions after this many hours if profit is weak",
+    )
+    inventory_min_profit_for_time_stop: float = Field(
+        default=0.005,
+        ge=0.0,
+        le=0.2,
+        description="Minimum return required to avoid time-stop forced reduction",
+    )
     advisor_interval_cycles: int = Field(
         default=30,
         ge=1,
@@ -279,6 +305,29 @@ class TradingSettings(BaseSettings):
         """Parse timeframes string into list."""
         return [tf.strip() for tf in self.timeframes.split(",")]
 
+    @property
+    def inventory_profit_levels_list(self) -> tuple[tuple[float, float], ...]:
+        """Parse inventory profit levels string into validated tuples."""
+        pairs: list[tuple[float, float]] = []
+        chunks = [item.strip() for item in self.inventory_profit_levels.split(",") if item.strip()]
+        for chunk in chunks:
+            left, sep, right = chunk.partition(":")
+            if sep != ":":
+                continue
+            try:
+                threshold = float(left)
+                fraction = float(right)
+            except ValueError:
+                continue
+            if threshold <= 0:
+                continue
+            if fraction <= 0:
+                continue
+            pairs.append((threshold, min(1.0, fraction)))
+        if pairs:
+            return tuple(sorted(pairs, key=lambda item: item[0]))
+        return ((0.015, 0.25), (0.025, 0.50), (0.040, 1.0))
+
 
 class RiskSettings(BaseSettings):
     """Risk management configuration."""
@@ -286,10 +335,22 @@ class RiskSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RISK_", extra="ignore", env_ignore_empty=True)
 
     per_trade: float = Field(default=0.005, description="Risk per trade (0.5%)")
+    min_per_trade: float = Field(default=0.001, description="Minimum dynamic risk per trade")
+    max_per_trade: float = Field(default=0.020, description="Maximum dynamic risk per trade")
     max_daily_loss: float = Field(default=0.02, description="Max daily loss (2%)")
     max_exposure: float = Field(default=0.25, description="Max exposure (25%)")
     fee_bps: int = Field(default=10, description="Trading fee in basis points")
     slippage_bps: int = Field(default=5, description="Expected slippage in basis points")
+    dynamic_sizing_enabled: bool = Field(default=True, description="Enable confidence/regime-based sizing")
+    confidence_sizing_enabled: bool = Field(default=True, description="Scale size by signal confidence")
+    regime_sizing_enabled: bool = Field(default=True, description="Scale size by detected market regime")
+    drawdown_scaling_enabled: bool = Field(default=True, description="Reduce size as drawdown increases")
+    drawdown_tier1_pct: float = Field(default=0.05, description="Drawdown threshold tier 1")
+    drawdown_tier1_mult: float = Field(default=0.80, description="Position size multiplier at tier 1")
+    drawdown_tier2_pct: float = Field(default=0.10, description="Drawdown threshold tier 2")
+    drawdown_tier2_mult: float = Field(default=0.50, description="Position size multiplier at tier 2")
+    drawdown_tier3_pct: float = Field(default=0.15, description="Drawdown threshold tier 3")
+    drawdown_tier3_mult: float = Field(default=0.20, description="Position size multiplier at tier 3")
 
 
 class ApprovalSettings(BaseSettings):
@@ -301,6 +362,16 @@ class ApprovalSettings(BaseSettings):
     auto_approve_enabled: bool = Field(
         default=False,
         description="Automatically approve AI proposals immediately after creation",
+    )
+    emergency_ai_enabled: bool = Field(
+        default=True,
+        description="Run automatic AI incident analysis whenever EMERGENCY_STOP is triggered",
+    )
+    emergency_max_proposals: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Maximum remediation proposals created per emergency-stop analysis",
     )
 
 
@@ -347,6 +418,27 @@ class LLMSettings(BaseSettings):
     )
 
 
+class MultiAgentSettings(BaseSettings):
+    """Multi-agent orchestration settings."""
+
+    model_config = SettingsConfigDict(env_prefix="MULTIAGENT_", extra="ignore", env_ignore_empty=True)
+
+    enabled: bool = Field(default=False, description="Enable multi-agent advisor orchestration")
+    max_proposals: int = Field(default=5, ge=1, le=20, description="Max merged proposals per cycle")
+    min_confidence: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence to keep agent proposal",
+    )
+    meta_agent_enabled: bool = Field(default=True, description="Enable meta-agent merge/ranking step")
+    strategy_agent_enabled: bool = Field(default=True, description="Enable strategy specialist agent")
+    risk_agent_enabled: bool = Field(default=True, description="Enable risk specialist agent")
+    market_agent_enabled: bool = Field(default=True, description="Enable market specialist agent")
+    execution_agent_enabled: bool = Field(default=True, description="Enable execution specialist agent")
+    sentiment_agent_enabled: bool = Field(default=True, description="Enable sentiment specialist agent")
+
+
 class APISettings(BaseSettings):
     """API server configuration."""
 
@@ -355,7 +447,11 @@ class APISettings(BaseSettings):
     host: str = Field(default="127.0.0.1", description="API host")
     port: int = Field(default=8000, description="API port")
     allowed_origins: str = Field(
-        default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
+        default=(
+            "http://localhost:3000,http://127.0.0.1:3000,"
+            "http://localhost:5173,http://127.0.0.1:5173,"
+            "http://localhost:8001,http://127.0.0.1:8001"
+        ),
         description="Comma-separated CORS allowlist",
     )
     rate_limit_enabled: bool = Field(default=True, description="Enable in-process API rate limiting")
@@ -496,6 +592,7 @@ class Settings(BaseSettings):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     approval: ApprovalSettings = Field(default_factory=ApprovalSettings)
     llm: LLMSettings = Field(default_factory=LLMSettings)
+    multiagent: MultiAgentSettings = Field(default_factory=MultiAgentSettings)
     api: APISettings = Field(default_factory=APISettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     log: LogSettings = Field(default_factory=LogSettings)
@@ -599,6 +696,7 @@ def _load_settings() -> Settings:
         risk=_build_settings_section(RiskSettings, settings_kwargs),
         approval=_build_settings_section(ApprovalSettings, settings_kwargs),
         llm=_build_settings_section(LLMSettings, settings_kwargs),
+        multiagent=_build_settings_section(MultiAgentSettings, settings_kwargs),
         api=_build_settings_section(APISettings, settings_kwargs),
         database=_build_settings_section(DatabaseSettings, settings_kwargs),
         log=_build_settings_section(LogSettings, settings_kwargs),

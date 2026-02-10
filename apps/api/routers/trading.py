@@ -6,6 +6,7 @@ Endpoints for trading operations, positions, and orders.
 
 import hashlib
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -16,6 +17,36 @@ from apps.api.security.auth import AuthUser, require_min_role
 from packages.core.config import AuthRole
 
 router = APIRouter()
+
+
+def _active_is_paper_mode() -> bool:
+    """Return whether current runtime mode is paper (False => live)."""
+    from packages.core.config import get_settings
+
+    return not get_settings().trading.live_mode
+
+
+def _split_symbol_assets(symbol: str) -> tuple[str, str]:
+    """Infer base/quote assets from spot symbol."""
+    quote_candidates = (
+        "USDT",
+        "FDUSD",
+        "USDC",
+        "BUSD",
+        "TUSD",
+        "BTC",
+        "ETH",
+        "BNB",
+        "TRY",
+        "EUR",
+        "BRL",
+    )
+    for quote_asset in quote_candidates:
+        if symbol.endswith(quote_asset) and len(symbol) > len(quote_asset):
+            return symbol[: -len(quote_asset)], quote_asset
+    if len(symbol) <= 4:
+        return symbol, ""
+    return symbol[:-4], symbol[-4:]
 
 
 class PositionResponse(BaseModel):
@@ -29,6 +60,21 @@ class PositionResponse(BaseModel):
     realized_pnl: str
     total_fees: str
     is_paper: bool
+
+
+class FundsResponse(BaseModel):
+    """Current account funds for active mode (paper/live)."""
+
+    symbol: str
+    base_asset: str
+    quote_asset: str
+    base_balance: str
+    quote_balance: str
+    mark_price: str
+    base_quote_value: str
+    estimated_total_equity: str
+    is_paper: bool
+    source: str
 
 
 class OrderResponse(BaseModel):
@@ -111,17 +157,40 @@ class ConfigResponse(BaseModel):
     grid_min_net_profit_bps: int
     grid_out_of_bounds_alert_cooldown_minutes: int
     grid_recenter_mode: str
+    regime_adaptation_enabled: bool
+    inventory_profit_levels: str
+    inventory_trailing_stop_pct: float
+    inventory_time_stop_hours: int
+    inventory_min_profit_for_time_stop: float
     stop_loss_enabled: bool
     stop_loss_global_equity_pct: float
     stop_loss_max_drawdown_pct: float
     stop_loss_auto_close_positions: bool
     risk_per_trade: float
+    risk_min_per_trade: float
+    risk_max_per_trade: float
+    risk_dynamic_sizing_enabled: bool
+    risk_confidence_sizing_enabled: bool
+    risk_regime_sizing_enabled: bool
+    risk_drawdown_scaling_enabled: bool
+    risk_drawdown_tier1_pct: float
+    risk_drawdown_tier1_mult: float
+    risk_drawdown_tier2_pct: float
+    risk_drawdown_tier2_mult: float
+    risk_drawdown_tier3_pct: float
+    risk_drawdown_tier3_mult: float
     max_daily_loss: float
     max_exposure: float
     fee_bps: int
     slippage_bps: int
     approval_timeout_hours: int
     approval_auto_approve_enabled: bool
+    approval_emergency_ai_enabled: bool
+    approval_emergency_max_proposals: int
+    multiagent_enabled: bool
+    multiagent_max_proposals: int
+    multiagent_min_confidence: float
+    multiagent_meta_agent_enabled: bool
 
 
 class PaperCycleResponse(BaseModel):
@@ -185,6 +254,34 @@ class LiveOrderResponse(BaseModel):
     order_id: str | None
     quantity: str | None
     price: str | None
+
+
+class CleanupTestArtifactsRequest(BaseModel):
+    """Admin cleanup request for known test-generated trade artifacts."""
+
+    dry_run: bool = Field(
+        default=True,
+        description="When true, only report matches without deleting rows.",
+    )
+    include_order_attempts: bool = Field(
+        default=True,
+        description="Also clean matching order_attempt rows tied to live_test_idem client IDs.",
+    )
+    reason: str = Field(default="cleanup_test_artifacts", min_length=3, max_length=200)
+
+
+class CleanupTestArtifactsResponse(BaseModel):
+    """Admin cleanup summary for known test-generated trade artifacts."""
+
+    dry_run: bool
+    reason: str
+    criteria: list[str]
+    matched_orders: int
+    matched_fills: int
+    matched_order_attempts: int
+    deleted_orders: int
+    deleted_fills: int
+    deleted_order_attempts: int
 
 
 class GridRecenterModeUpdateRequest(BaseModel):
@@ -255,7 +352,7 @@ async def get_trading_config(
     settings = get_settings()
     service = get_trading_cycle_service()
     effective_recenter_mode = settings.trading.grid_recenter_mode
-    if service.strategy.name == "smart_grid_ai":
+    if service.strategy.name in {"smart_grid_ai", "enhanced_smart_grid"}:
         effective_recenter_mode = cast(str, getattr(service.strategy, "recenter_mode", effective_recenter_mode))
     return ConfigResponse(
         trading_pair=settings.trading.pair,
@@ -288,17 +385,40 @@ async def get_trading_config(
         grid_min_net_profit_bps=settings.trading.grid_min_net_profit_bps,
         grid_out_of_bounds_alert_cooldown_minutes=settings.trading.grid_out_of_bounds_alert_cooldown_minutes,
         grid_recenter_mode=effective_recenter_mode,
+        regime_adaptation_enabled=settings.trading.regime_adaptation_enabled,
+        inventory_profit_levels=settings.trading.inventory_profit_levels,
+        inventory_trailing_stop_pct=settings.trading.inventory_trailing_stop_pct,
+        inventory_time_stop_hours=settings.trading.inventory_time_stop_hours,
+        inventory_min_profit_for_time_stop=settings.trading.inventory_min_profit_for_time_stop,
         stop_loss_enabled=settings.trading.stop_loss_enabled,
         stop_loss_global_equity_pct=settings.trading.stop_loss_global_equity_pct,
         stop_loss_max_drawdown_pct=settings.trading.stop_loss_max_drawdown_pct,
         stop_loss_auto_close_positions=settings.trading.stop_loss_auto_close_positions,
         risk_per_trade=settings.risk.per_trade,
+        risk_min_per_trade=settings.risk.min_per_trade,
+        risk_max_per_trade=settings.risk.max_per_trade,
+        risk_dynamic_sizing_enabled=settings.risk.dynamic_sizing_enabled,
+        risk_confidence_sizing_enabled=settings.risk.confidence_sizing_enabled,
+        risk_regime_sizing_enabled=settings.risk.regime_sizing_enabled,
+        risk_drawdown_scaling_enabled=settings.risk.drawdown_scaling_enabled,
+        risk_drawdown_tier1_pct=settings.risk.drawdown_tier1_pct,
+        risk_drawdown_tier1_mult=settings.risk.drawdown_tier1_mult,
+        risk_drawdown_tier2_pct=settings.risk.drawdown_tier2_pct,
+        risk_drawdown_tier2_mult=settings.risk.drawdown_tier2_mult,
+        risk_drawdown_tier3_pct=settings.risk.drawdown_tier3_pct,
+        risk_drawdown_tier3_mult=settings.risk.drawdown_tier3_mult,
         max_daily_loss=settings.risk.max_daily_loss,
         max_exposure=settings.risk.max_exposure,
         fee_bps=settings.risk.fee_bps,
         slippage_bps=settings.risk.slippage_bps,
         approval_timeout_hours=settings.approval.timeout_hours,
         approval_auto_approve_enabled=settings.approval.auto_approve_enabled,
+        approval_emergency_ai_enabled=settings.approval.emergency_ai_enabled,
+        approval_emergency_max_proposals=settings.approval.emergency_max_proposals,
+        multiagent_enabled=settings.multiagent.enabled,
+        multiagent_max_proposals=settings.multiagent.max_proposals,
+        multiagent_min_confidence=settings.multiagent.min_confidence,
+        multiagent_meta_agent_enabled=settings.multiagent.meta_agent_enabled,
     )
 
 
@@ -317,7 +437,7 @@ async def set_grid_recenter_mode(
     service = get_trading_cycle_service()
     mode = service.set_grid_recenter_mode(payload.mode)
     get_settings().trading.grid_recenter_mode = mode
-    applied = service.strategy.name == "smart_grid_ai"
+    applied = service.strategy.name in {"smart_grid_ai", "enhanced_smart_grid"}
 
     async with get_session() as session:
         await log_event(
@@ -353,15 +473,42 @@ async def get_current_position(
 
     await _ensure_database()
     settings = get_settings()
+    is_paper_mode = _active_is_paper_mode()
+    base_asset, _quote_asset = _split_symbol_assets(settings.trading.pair)
 
     async with get_session() as session:
         result = await session.execute(
             select(Position).where(
                 Position.symbol == settings.trading.pair,
-                Position.is_paper.is_(True),
+                Position.is_paper.is_(is_paper_mode),
             )
         )
         position = result.scalar_one_or_none()
+
+    if not is_paper_mode:
+        # In live mode expose current exchange inventory even if DB position is stale/empty.
+        try:
+            from packages.adapters.binance_live import get_binance_live_adapter
+
+            balances = await get_binance_live_adapter().get_account_balances()
+            live_qty = Decimal(str(balances.get(base_asset, Decimal("0"))))
+            db_realized = Decimal(str(position.realized_pnl)) if position is not None else Decimal("0")
+            db_unrealized = Decimal(str(position.unrealized_pnl)) if position is not None else Decimal("0")
+            db_avg_entry = Decimal(str(position.avg_entry_price)) if position is not None else Decimal("0")
+            db_total_fees = Decimal(str(position.total_fees)) if position is not None else Decimal("0")
+            return PositionResponse(
+                symbol=settings.trading.pair,
+                side="LONG" if live_qty > 0 else None,
+                quantity=str(live_qty),
+                avg_entry_price=str(db_avg_entry),
+                unrealized_pnl=str(db_unrealized),
+                realized_pnl=str(db_realized),
+                total_fees=str(db_total_fees),
+                is_paper=False,
+            )
+        except Exception:
+            # Fall back to DB-only view if exchange lookup fails.
+            pass
 
     if position is None:
         return PositionResponse(
@@ -372,7 +519,7 @@ async def get_current_position(
             unrealized_pnl="0",
             realized_pnl="0",
             total_fees="0",
-            is_paper=True,
+            is_paper=is_paper_mode,
         )
 
     return PositionResponse(
@@ -384,6 +531,101 @@ async def get_current_position(
         realized_pnl=str(position.realized_pnl),
         total_fees=str(position.total_fees),
         is_paper=position.is_paper,
+    )
+
+
+@router.get("/funds", response_model=FundsResponse)
+async def get_current_funds(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> FundsResponse:
+    """Get current base/quote funds in active mode."""
+    from packages.adapters.binance_live import get_binance_live_adapter
+    from packages.adapters.binance_spot import get_binance_adapter
+    from packages.core.config import get_settings
+    from packages.core.database.models import EquitySnapshot, Position
+    from packages.core.database.repositories import CandleRepository
+    from packages.core.database.session import get_session
+
+    await _ensure_database()
+    settings = get_settings()
+    symbol = settings.trading.pair
+    base_asset, quote_asset = _split_symbol_assets(symbol)
+    is_paper_mode = _active_is_paper_mode()
+
+    if not is_paper_mode:
+        try:
+            balances = await get_binance_live_adapter().get_account_balances()
+            mark_price = await get_binance_adapter().get_ticker_price(symbol)
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Unable to fetch live account funds: {e}")
+
+        base_balance = Decimal(str(balances.get(base_asset, Decimal("0"))))
+        quote_balance = Decimal(str(balances.get(quote_asset, Decimal("0"))))
+        base_quote_value = base_balance * mark_price
+        estimated_total_equity = quote_balance + base_quote_value
+
+        return FundsResponse(
+            symbol=symbol,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            base_balance=str(base_balance),
+            quote_balance=str(quote_balance),
+            mark_price=str(mark_price),
+            base_quote_value=str(base_quote_value),
+            estimated_total_equity=str(estimated_total_equity),
+            is_paper=False,
+            source="live_exchange",
+        )
+
+    async with get_session() as session:
+        position_result = await session.execute(
+            select(Position).where(
+                Position.symbol == symbol,
+                Position.is_paper.is_(True),
+            )
+        )
+        position = position_result.scalar_one_or_none()
+
+        snapshot_result = await session.execute(
+            select(EquitySnapshot)
+            .where(EquitySnapshot.is_paper.is_(True))
+            .order_by(EquitySnapshot.snapshot_at.desc())
+            .limit(1)
+        )
+        snapshot = snapshot_result.scalar_one_or_none()
+
+        repo = CandleRepository(session)
+        mark_price = await repo.get_latest_close_price(symbol, "1h") or Decimal("0")
+        if mark_price <= 0:
+            mark_price = await repo.get_latest_close_price(symbol, "4h") or Decimal("0")
+        if mark_price <= 0 and position is not None:
+            fallback_price = Decimal(str(position.avg_entry_price))
+            if fallback_price > 0:
+                mark_price = fallback_price
+
+        base_balance = Decimal(str(position.quantity)) if position is not None else Decimal("0")
+        base_quote_value = base_balance * mark_price
+
+        if snapshot is not None:
+            quote_balance = Decimal(str(snapshot.available_balance))
+            estimated_total_equity = Decimal(str(snapshot.equity))
+        else:
+            realized_pnl = Decimal(str(position.realized_pnl)) if position is not None else Decimal("0")
+            unrealized_pnl = Decimal(str(position.unrealized_pnl)) if position is not None else Decimal("0")
+            estimated_total_equity = Decimal(str(settings.trading.paper_starting_equity)) + realized_pnl + unrealized_pnl
+            quote_balance = estimated_total_equity - base_quote_value
+
+    return FundsResponse(
+        symbol=symbol,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+        base_balance=str(base_balance),
+        quote_balance=str(quote_balance),
+        mark_price=str(mark_price),
+        base_quote_value=str(base_quote_value),
+        estimated_total_equity=str(estimated_total_equity),
+        is_paper=True,
+        source="paper_simulated",
     )
 
 
@@ -454,9 +696,10 @@ async def get_orders(
     from packages.core.database.session import get_session
 
     await _ensure_database()
+    is_paper_mode = _active_is_paper_mode()
 
     async with get_session() as session:
-        query = select(Order).where(Order.is_paper.is_(True)).order_by(Order.created_at.desc()).limit(limit)
+        query = select(Order).where(Order.is_paper.is_(is_paper_mode)).order_by(Order.created_at.desc()).limit(limit)
         if status:
             query = query.where(Order.status == status.upper())
 
@@ -492,10 +735,11 @@ async def get_fills(
     from packages.core.database.session import get_session
 
     await _ensure_database()
+    is_paper_mode = _active_is_paper_mode()
 
     async with get_session() as session:
         result = await session.execute(
-            select(Fill).where(Fill.is_paper.is_(True)).order_by(Fill.filled_at.desc()).limit(limit)
+            select(Fill).where(Fill.is_paper.is_(is_paper_mode)).order_by(Fill.filled_at.desc()).limit(limit)
         )
         fills = result.scalars().all()
 
@@ -523,11 +767,12 @@ async def get_metrics(_: AuthUser = Depends(require_min_role(AuthRole.VIEWER))) 
     from packages.core.database.session import get_session
 
     await _ensure_database()
+    is_paper_mode = _active_is_paper_mode()
 
     async with get_session() as session:
         result = await session.execute(
             select(MetricsSnapshot)
-            .where(MetricsSnapshot.is_paper.is_(True))
+            .where(MetricsSnapshot.is_paper.is_(is_paper_mode))
             .order_by(MetricsSnapshot.snapshot_at.desc())
             .limit(1)
         )
@@ -572,19 +817,19 @@ async def get_equity_history(
 
     await _ensure_database()
     cutoff = datetime.now(UTC) - timedelta(days=days)
+    is_paper_mode = _active_is_paper_mode()
 
     async with get_session() as session:
         result = await session.execute(
             select(EquitySnapshot)
             .where(
-                EquitySnapshot.is_paper.is_(True),
+                EquitySnapshot.is_paper.is_(is_paper_mode),
                 EquitySnapshot.snapshot_at >= cutoff,
             )
             .order_by(EquitySnapshot.snapshot_at.asc())
         )
         snapshots = result.scalars().all()
-
-    return [
+    payload = [
         {
             "timestamp": snapshot.snapshot_at.isoformat(),
             "equity": str(snapshot.equity),
@@ -593,6 +838,35 @@ async def get_equity_history(
         }
         for snapshot in snapshots
     ]
+
+    if not is_paper_mode:
+        # Append a fresh live valuation point so dashboard equity reflects exchange funds immediately.
+        try:
+            from packages.adapters.binance_live import get_binance_live_adapter
+            from packages.adapters.binance_spot import get_binance_adapter
+            from packages.core.config import get_settings
+
+            settings = get_settings()
+            symbol = settings.trading.pair
+            base_asset, quote_asset = _split_symbol_assets(symbol)
+            balances = await get_binance_live_adapter().get_account_balances()
+            mark_price = await get_binance_adapter().get_ticker_price(symbol)
+            base_balance = Decimal(str(balances.get(base_asset, Decimal("0"))))
+            quote_balance = Decimal(str(balances.get(quote_asset, Decimal("0"))))
+            live_equity = quote_balance + (base_balance * mark_price)
+            payload.append(
+                {
+                    "timestamp": datetime.now(UTC).isoformat(),
+                    "equity": str(live_equity),
+                    "available_balance": str(quote_balance),
+                    "unrealized_pnl": "0",
+                }
+            )
+        except Exception:
+            # Keep historical DB data if live valuation is temporarily unavailable.
+            pass
+
+    return payload
 
 
 @router.post("/paper/cycle", response_model=PaperCycleResponse)
@@ -697,26 +971,30 @@ async def reset_paper_account(
     deleted_equity_snapshots = 0
     deleted_metrics_snapshots = 0
 
+    def _rowcount(result: Any) -> int:
+        value = getattr(result, "rowcount", 0)
+        return int(value or 0)
+
     try:
         async with get_session() as session:
             fills_result = await session.execute(delete(Fill).where(Fill.is_paper.is_(True)))
-            deleted_fills = int(fills_result.rowcount or 0)
+            deleted_fills = _rowcount(fills_result)
 
             orders_result = await session.execute(delete(Order).where(Order.is_paper.is_(True)))
-            deleted_orders = int(orders_result.rowcount or 0)
+            deleted_orders = _rowcount(orders_result)
 
             positions_result = await session.execute(delete(Position).where(Position.is_paper.is_(True)))
-            deleted_positions = int(positions_result.rowcount or 0)
+            deleted_positions = _rowcount(positions_result)
 
             equity_result = await session.execute(
                 delete(EquitySnapshot).where(EquitySnapshot.is_paper.is_(True))
             )
-            deleted_equity_snapshots = int(equity_result.rowcount or 0)
+            deleted_equity_snapshots = _rowcount(equity_result)
 
             metrics_result = await session.execute(
                 delete(MetricsSnapshot).where(MetricsSnapshot.is_paper.is_(True))
             )
-            deleted_metrics_snapshots = int(metrics_result.rowcount or 0)
+            deleted_metrics_snapshots = _rowcount(metrics_result)
 
             await log_event(
                 session,
@@ -949,4 +1227,113 @@ async def submit_live_order(
             order_id=result.order_id,
             quantity=str(result.quantity) if result.quantity is not None else None,
             price=str(result.price) if result.price is not None else None,
+        )
+
+
+@router.post("/admin/cleanup-test-artifacts", response_model=CleanupTestArtifactsResponse)
+async def cleanup_test_artifacts(
+    request: CleanupTestArtifactsRequest,
+    user: AuthUser = Depends(require_min_role(AuthRole.ADMIN)),
+) -> CleanupTestArtifactsResponse:
+    """
+    Clean known test-generated live trade artifacts.
+
+    Scope is intentionally narrow:
+    - strategy_name=manual_live
+    - signal_reason=idempotency_test
+    - non-paper rows
+    - exchange_order_id='123456' or client_order_id prefixed with 'live_test_idem_'
+    """
+    from packages.core.audit import log_event
+    from packages.core.database.models import Fill, Order, OrderAttempt
+    from packages.core.database.session import get_session
+
+    await _ensure_database()
+    criteria = [
+        "orders.is_paper = false",
+        "orders.strategy_name = manual_live",
+        "orders.signal_reason = idempotency_test",
+        "orders.exchange_order_id = 123456 OR orders.client_order_id LIKE live_test_idem_%",
+    ]
+    deleted_orders = 0
+    deleted_fills = 0
+    deleted_order_attempts = 0
+
+    async with get_session() as session:
+        order_rows = await session.execute(
+            select(Order.id).where(
+                Order.is_paper.is_(False),
+                Order.strategy_name == "manual_live",
+                Order.signal_reason == "idempotency_test",
+                ((Order.exchange_order_id == "123456") | Order.client_order_id.like("live_test_idem_%")),
+            )
+        )
+        order_ids = [int(order_id) for order_id in order_rows.scalars().all()]
+        matched_orders = len(order_ids)
+
+        matched_fills = 0
+        if order_ids:
+            fill_rows = await session.execute(select(Fill.id).where(Fill.order_id.in_(order_ids)))
+            matched_fills = len(fill_rows.scalars().all())
+
+        matched_order_attempts = 0
+        if request.include_order_attempts:
+            attempt_rows = await session.execute(
+                select(OrderAttempt.id).where(
+                    OrderAttempt.client_order_id.like("live_test_idem_%")
+                    | (OrderAttempt.exchange_order_id == "123456")
+                )
+            )
+            matched_order_attempts = len(attempt_rows.scalars().all())
+
+        if not request.dry_run:
+            if order_ids:
+                fills_result = await session.execute(delete(Fill).where(Fill.order_id.in_(order_ids)))
+                deleted_fills = int(getattr(fills_result, "rowcount", 0) or 0)
+                orders_result = await session.execute(delete(Order).where(Order.id.in_(order_ids)))
+                deleted_orders = int(getattr(orders_result, "rowcount", 0) or 0)
+
+            if request.include_order_attempts:
+                attempts_result = await session.execute(
+                    delete(OrderAttempt).where(
+                        OrderAttempt.client_order_id.like("live_test_idem_%")
+                        | (OrderAttempt.exchange_order_id == "123456")
+                    )
+                )
+                deleted_order_attempts = int(getattr(attempts_result, "rowcount", 0) or 0)
+
+        await log_event(
+            session,
+            event_type="admin_test_artifacts_cleanup",
+            event_category="system",
+            summary=(
+                "Dry-run test artifact cleanup completed"
+                if request.dry_run
+                else "Test artifact cleanup executed"
+            ),
+            details={
+                "dry_run": request.dry_run,
+                "criteria": criteria,
+                "matched_orders": matched_orders,
+                "matched_fills": matched_fills,
+                "matched_order_attempts": matched_order_attempts,
+                "deleted_orders": deleted_orders,
+                "deleted_fills": deleted_fills,
+                "deleted_order_attempts": deleted_order_attempts,
+                "include_order_attempts": request.include_order_attempts,
+                "reason": request.reason,
+            },
+            actor=user.username,
+        )
+
+        return CleanupTestArtifactsResponse(
+            dry_run=request.dry_run,
+            reason=request.reason,
+            criteria=criteria,
+            matched_orders=matched_orders,
+            matched_fills=matched_fills,
+            matched_order_attempts=matched_order_attempts,
+            deleted_orders=deleted_orders,
+            deleted_fills=deleted_fills,
+            deleted_order_attempts=deleted_order_attempts,
         )

@@ -105,6 +105,16 @@ class LLMAdvisorClient:
 
     async def generate_proposals(self, context: dict[str, Any]) -> list[dict[str, Any]]:
         """Generate raw proposal dicts from the configured LLM provider."""
+        return await self.generate_structured(context=context, system_prompt=None, schema=None)
+
+    async def generate_structured(
+        self,
+        *,
+        context: dict[str, Any],
+        system_prompt: str | None = None,
+        schema: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Generate raw proposal dicts with optional schema/system-prompt overrides."""
         settings = get_settings().llm
         if not settings.enabled:
             return []
@@ -112,8 +122,8 @@ class LLMAdvisorClient:
             self._last_error = "LLM enabled but missing required configuration"
             return []
 
-        prompt = self._build_user_prompt(context)
-        body = self._build_request_payload(settings, prompt)
+        prompt = self._build_user_prompt(context=context, schema=schema)
+        body = self._build_request_payload(settings, prompt, system_prompt_override=system_prompt)
         url = self._resolve_url(settings)
         headers = self._build_headers(settings)
 
@@ -172,8 +182,8 @@ class LLMAdvisorClient:
         return bool(settings.api_key.strip())
 
     @staticmethod
-    def _build_user_prompt(context: dict[str, Any]) -> str:
-        schema = {
+    def _build_user_prompt(context: dict[str, Any], schema: dict[str, Any] | None) -> str:
+        default_schema = {
             "proposals": [
                 {
                     "title": "string",
@@ -206,10 +216,11 @@ class LLMAdvisorClient:
                 }
             ]
         }
+        effective_schema = schema if isinstance(schema, dict) else default_schema
         return (
             "Return ONLY a JSON object following this schema.\n"
             "No markdown, no prose, no code fences.\n"
-            f"Schema:\n{json.dumps(schema)}\n\n"
+            f"Schema:\n{json.dumps(effective_schema)}\n\n"
             "Context:\n"
             f"{json.dumps(context, default=str)}"
         )
@@ -253,8 +264,13 @@ class LLMAdvisorClient:
         return {"Content-Type": "application/json"}
 
     @staticmethod
-    def _build_request_payload(settings: LLMSettings, user_prompt: str) -> dict[str, Any]:
-        system_prompt = settings.system_prompt.strip() or (
+    def _build_request_payload(
+        settings: LLMSettings,
+        user_prompt: str,
+        *,
+        system_prompt_override: str | None = None,
+    ) -> dict[str, Any]:
+        system_prompt = (system_prompt_override or settings.system_prompt).strip() or (
             "You are a crypto trading assistant. Return strict JSON proposals only."
         )
         provider = settings.provider
@@ -374,4 +390,3 @@ def get_llm_advisor_client() -> LLMAdvisorClient:
             if _llm_client is None:
                 _llm_client = LLMAdvisorClient()
     return _llm_client
-

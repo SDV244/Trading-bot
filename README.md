@@ -107,6 +107,12 @@ Set required values in `.env`:
 - `TRADING_SPOT_POSITION_MODE=long_flat`
 - `TRADING_PAPER_STARTING_EQUITY=10000`
 - optional tuned profile: `TRADING_ACTIVE_STRATEGY=trend_ema_fast`
+- smart-grid profile: `TRADING_ACTIVE_STRATEGY=smart_grid_ai|enhanced_smart_grid`
+- regime/inventory controls:
+  - `TRADING_REGIME_ADAPTATION_ENABLED=true`
+  - `TRADING_INVENTORY_PROFIT_LEVELS=0.015:0.25,0.025:0.50,0.040:1.0`
+  - `TRADING_INVENTORY_TRAILING_STOP_PCT=0.02`
+  - `TRADING_INVENTORY_TIME_STOP_HOURS=48`
 - use `APP_SECRETS_DIR` for credentials (file-per-secret)
 - `BINANCE_API_KEY` and `BINANCE_API_SECRET` are only required for live/signed flows
 - optional LLM advisor:
@@ -115,6 +121,10 @@ Set required values in `.env`:
   - `LLM_MODEL=<provider-model>`
   - `LLM_API_KEY=<secret>` (not required for local Ollama)
   - optional `LLM_BASE_URL` for self-hosted or gateway routing
+- optional multi-agent orchestration (uses same LLM provider):
+  - `MULTIAGENT_ENABLED=true`
+  - `MULTIAGENT_MAX_PROPOSALS=5`
+  - `MULTIAGENT_META_AGENT_ENABLED=true`
 - optional Telegram:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_CHAT_ID`

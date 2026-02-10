@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 SignalSide = Literal["BUY", "SELL", "HOLD"]
 
@@ -16,7 +16,7 @@ class Signal:
     side: SignalSide
     confidence: float
     reason: str
-    indicators: dict[str, float] = field(default_factory=dict)
+    indicators: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True, frozen=True)

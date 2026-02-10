@@ -41,12 +41,17 @@ This document explains the runtime flow end-to-end.
 Before scheduler start, the system evaluates strategy candle requirements.
 If `TRADING_REQUIRE_DATA_READY=true` and warmup is incomplete, scheduler start is blocked.
 Paper risk sizing/equity baselines use `TRADING_PAPER_STARTING_EQUITY`.
-When `TRADING_ACTIVE_STRATEGY=smart_grid_ai`, the cycle uses adaptive grid spacing
-based on ATR/volatility plus 4h regime tilt.
+When `TRADING_ACTIVE_STRATEGY=smart_grid_ai|enhanced_smart_grid`, the cycle uses adaptive
+grid spacing based on ATR/volatility plus regime detection (trend/volatility/breakout state).
 Optional controls for smart-grid operations:
 - `TRADING_GRID_SPACING_MODE=geometric|arithmetic`
 - `TRADING_GRID_COOLDOWN_SECONDS` to avoid overtrading bursts
 - `TRADING_GRID_AUTO_INVENTORY_BOOTSTRAP=true` to seed initial spot inventory when flat + SELL signal appears
+- `TRADING_REGIME_ADAPTATION_ENABLED=true` to enable regime-driven spacing/levels
+- inventory profit-lock controls:
+  - `TRADING_INVENTORY_PROFIT_LEVELS=0.015:0.25,0.025:0.50,0.040:1.0`
+  - `TRADING_INVENTORY_TRAILING_STOP_PCT`
+  - `TRADING_INVENTORY_TIME_STOP_HOURS`
 
 ## 4) State Machine
 
@@ -70,6 +75,8 @@ Rules:
    asks the configured LLM provider (`openai|anthropic|gemini|ollama`) for proposals.
    - LLM output is schema-filtered and key-whitelisted before entering approvals.
    - if configured fallback is enabled, built-in rule proposals are used when LLM output is empty/invalid.
+   - optional `MULTIAGENT_ENABLED=true` runs strategy/risk/market/execution/sentiment agents and
+     merges ranked proposals through meta-agent conflict filtering.
    - for `smart_grid_ai`, advisor can emit grid-specific tuning proposals
      (`grid_levels`, spacing bounds, volatility blend) based on win-rate/drawdown.
 2. Proposal is saved as `PENDING` in `approvals`.

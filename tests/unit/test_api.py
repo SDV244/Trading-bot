@@ -3,6 +3,7 @@ Tests for API endpoints.
 """
 
 import asyncio
+from decimal import Decimal
 from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
@@ -136,6 +137,27 @@ class TestSystemEndpoints:
         data = response.json()
         assert data["state"] == "emergency_stop"
         assert data["can_trade"] is False
+
+        # Manual resume to reset state
+        client.post(
+            "/api/system/state",
+            json={"action": "manual_resume", "reason": "Reset", "changed_by": "test"},
+        )
+
+    def test_emergency_stop_triggers_ai_analysis(self):
+        """Emergency stop endpoint should invoke emergency AI analyzer."""
+        client = TestClient(app)
+        mock_analyzer = Mock()
+        mock_analyzer.analyze_and_enqueue = AsyncMock()
+
+        with patch("apps.api.routers.system.get_emergency_stop_analyzer", return_value=mock_analyzer):
+            response = client.post(
+                "/api/system/emergency-stop",
+                json={"reason": "Test emergency", "changed_by": "test"},
+            )
+
+        assert response.status_code == 200
+        assert mock_analyzer.analyze_and_enqueue.await_count == 1
 
         # Manual resume to reset state
         client.post(
@@ -369,6 +391,8 @@ class TestTradingEndpoints:
         assert data["stop_loss_global_equity_pct"] == 0.15
         assert data["stop_loss_max_drawdown_pct"] == 0.2
         assert data["approval_auto_approve_enabled"] is False
+        assert data["approval_emergency_ai_enabled"] is True
+        assert data["approval_emergency_max_proposals"] == 3
 
     def test_set_grid_recenter_mode(self, monkeypatch):
         """Can update smart-grid recenter mode at runtime from API."""
@@ -399,6 +423,23 @@ class TestTradingEndpoints:
         data = response.json()
         assert data["symbol"] == "BTCUSDT"
         assert "quantity" in data
+
+    def test_get_funds(self, monkeypatch):
+        """Can get current funds payload for active mode."""
+        monkeypatch.setenv("TRADING_LIVE_MODE", "false")
+        monkeypatch.setenv("TRADING_PAIR", "BTCUSDT")
+        reload_settings()
+        client = TestClient(app)
+        response = client.get("/api/trading/funds")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["symbol"] == "BTCUSDT"
+        assert data["base_asset"] == "BTC"
+        assert data["quote_asset"] == "USDT"
+        assert "base_balance" in data
+        assert "quote_balance" in data
+        assert "estimated_total_equity" in data
+        assert data["is_paper"] is True
 
     def test_get_grid_preview_endpoint(self):
         """Smart-grid preview endpoint is reachable for dashboard UX."""
@@ -431,6 +472,32 @@ class TestTradingEndpoints:
         assert "total_trades" in data
         assert "max_drawdown" in data
 
+    def test_get_equity_history_live_appends_exchange_point(self, monkeypatch):
+        """Live equity history should include a fresh exchange-valued point."""
+        monkeypatch.setenv("TRADING_LIVE_MODE", "true")
+        monkeypatch.setenv("BINANCE_API_KEY", "key")
+        monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+        reload_settings()
+
+        client = TestClient(app)
+        mock_live_adapter = Mock()
+        mock_live_adapter.get_account_balances = AsyncMock(return_value={"BTC": Decimal("0.01"), "USDT": Decimal("100")})
+        mock_spot_adapter = Mock()
+        mock_spot_adapter.get_ticker_price = AsyncMock(return_value=Decimal("50000"))
+
+        with patch("packages.adapters.binance_live.get_binance_live_adapter", return_value=mock_live_adapter), patch(
+            "packages.adapters.binance_spot.get_binance_adapter", return_value=mock_spot_adapter
+        ):
+            response = client.get("/api/trading/equity/history?days=1")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert isinstance(payload, list)
+        assert payload
+        latest = payload[-1]
+        assert Decimal(str(latest["equity"])) == Decimal("600")
+        assert Decimal(str(latest["available_balance"])) == Decimal("100")
+
     def test_run_paper_cycle(self):
         """Can trigger one paper trading cycle."""
         client = TestClient(app)
@@ -453,8 +520,10 @@ class TestTradingEndpoints:
         assert "executed" in data
         assert "risk_reason" in data
 
-    def test_paper_reset_requires_paused_state(self):
+    def test_paper_reset_requires_paused_state(self, monkeypatch):
         """Paper reset should be blocked unless the system is paused."""
+        monkeypatch.setenv("TRADING_LIVE_MODE", "false")
+        reload_settings()
         client = TestClient(app)
         client.post(
             "/api/system/state",
@@ -471,8 +540,10 @@ class TestTradingEndpoints:
         assert response.status_code == 409
         assert "requires system state PAUSED" in response.json()["detail"]
 
-    def test_paper_reset_endpoint(self):
+    def test_paper_reset_endpoint(self, monkeypatch):
         """Paper reset clears paper-mode history and returns counters."""
+        monkeypatch.setenv("TRADING_LIVE_MODE", "false")
+        reload_settings()
         client = TestClient(app)
         client.post(
             "/api/system/state",
@@ -573,6 +644,91 @@ class TestTradingEndpoints:
         }
         assert mock_execute.await_count == 1
 
+    def test_admin_cleanup_test_artifacts_endpoint(self, monkeypatch):
+        """Admin cleanup endpoint can dry-run and delete known test artifacts."""
+        from decimal import Decimal
+
+        from packages.core.database.models import Fill, Order, OrderAttempt, OrderAttemptStatus
+        from packages.core.database.session import get_session, init_database
+
+        monkeypatch.setenv("TRADING_LIVE_MODE", "true")
+        monkeypatch.setenv("BINANCE_API_KEY", "key")
+        monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+        reload_settings()
+        client = TestClient(app)
+
+        client_order_id = f"live_test_idem_{uuid4().hex[:12]}"
+
+        async def _seed() -> None:
+            await init_database()
+            async with get_session() as session:
+                order = Order(
+                    client_order_id=client_order_id,
+                    exchange_order_id="123456",
+                    symbol="BTCUSDT",
+                    side="BUY",
+                    order_type="MARKET",
+                    quantity=Decimal("0.01"),
+                    price=Decimal("50000"),
+                    status="FILLED",
+                    is_paper=False,
+                    strategy_name="manual_live",
+                    signal_reason="idempotency_test",
+                    config_version=1,
+                )
+                session.add(order)
+                await session.flush()
+                session.add(
+                    Fill(
+                        order_id=order.id,
+                        fill_id=f"live_{order.id}_123456",
+                        quantity=Decimal("0.01"),
+                        price=Decimal("50000"),
+                        fee=Decimal("0"),
+                        fee_asset="USDT",
+                        is_paper=False,
+                        slippage_bps=None,
+                    )
+                )
+                session.add(
+                    OrderAttempt(
+                        idempotency_key=f"idem-{uuid4().hex}",
+                        symbol="BTCUSDT",
+                        side="BUY",
+                        order_type="MARKET",
+                        quantity=Decimal("0.01"),
+                        status=OrderAttemptStatus.CONFIRMED.value,
+                        client_order_id=client_order_id,
+                        exchange_order_id="123456",
+                        error_message=None,
+                    )
+                )
+
+        asyncio.run(_seed())
+
+        dry_run = client.post(
+            "/api/trading/admin/cleanup-test-artifacts",
+            json={"dry_run": True, "reason": "test_dry_run"},
+        )
+        assert dry_run.status_code == 200
+        dry_data = dry_run.json()
+        assert dry_data["dry_run"] is True
+        assert dry_data["matched_orders"] >= 1
+        assert dry_data["matched_fills"] >= 1
+        assert dry_data["deleted_orders"] == 0
+        assert dry_data["deleted_fills"] == 0
+
+        execute = client.post(
+            "/api/trading/admin/cleanup-test-artifacts",
+            json={"dry_run": False, "reason": "test_execute_cleanup"},
+        )
+        assert execute.status_code == 200
+        exec_data = execute.json()
+        assert exec_data["dry_run"] is False
+        assert exec_data["deleted_orders"] >= 1
+        assert exec_data["deleted_fills"] >= 1
+        assert exec_data["deleted_order_attempts"] >= 1
+
 
 class TestAIEndpoints:
     """Test AI and approvals endpoints."""
@@ -623,6 +779,36 @@ class TestAIEndpoints:
         assert data["provider"] == "ollama"
         assert data["raw_proposals_count"] == 1
 
+    def test_multiagent_status_endpoint(self):
+        """Multi-agent status endpoint is available."""
+        client = TestClient(app)
+        response = client.get("/api/ai/multi-agent/status")
+        assert response.status_code == 200
+        data = response.json()
+        assert "enabled" in data
+        assert "max_proposals" in data
+        assert "meta_agent_enabled" in data
+
+    def test_multiagent_test_endpoint(self):
+        """Multi-agent test endpoint returns diagnostics."""
+        client = TestClient(app)
+        mock_advisor = Mock()
+        mock_advisor.test_multiagent_connection = AsyncMock(
+            return_value={
+                "ok": True,
+                "enabled": True,
+                "message": "ok",
+                "agents_used": ["strategy_agent", "risk_agent"],
+                "proposal_count": 2,
+            }
+        )
+        with patch("apps.api.routers.ai.get_ai_advisor", return_value=mock_advisor):
+            response = client.post("/api/ai/multi-agent/test")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["ok"] is True
+        assert data["proposal_count"] == 2
+
     def test_optimizer_endpoints_require_data(self):
         """Optimizer endpoints reject when insufficient data."""
         client = TestClient(app)
@@ -664,6 +850,49 @@ class TestAIEndpoints:
         )
         assert disabled.status_code == 200
         assert disabled.json()["enabled"] is False
+
+    def test_emergency_analyze_now_endpoint(self):
+        """Manual emergency analysis endpoint returns structured output."""
+        from packages.core.ai.emergency_analyzer import EmergencyAnalysisOutcome
+
+        client = TestClient(app)
+        mock_analyzer = Mock()
+        mock_analyzer.analyze_and_enqueue = AsyncMock(
+            return_value=EmergencyAnalysisOutcome(
+                triggered=True,
+                source="manual_test",
+                reason="test reason",
+                used_llm=False,
+                llm_error=None,
+                proposals_generated=1,
+                approvals_created=1,
+                approvals_auto_approved=0,
+                proposal_titles=("test proposal",),
+                approval_ids=(123,),
+            )
+        )
+
+        with patch("apps.api.routers.ai.get_emergency_stop_analyzer", return_value=mock_analyzer):
+            response = client.post(
+                "/api/ai/emergency/analyze-now",
+                json={"reason": "test reason", "source": "manual_test", "metadata": {"k": "v"}},
+            )
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["triggered"] is True
+        assert payload["source"] == "manual_test"
+        assert payload["reason"] == "test reason"
+        assert payload["proposals_generated"] == 1
+        assert payload["approval_ids"] == [123]
+
+    def test_last_emergency_analysis_endpoint(self):
+        """Last emergency analysis endpoint is available and returns a shape."""
+        client = TestClient(app)
+        response = client.get("/api/ai/emergency/last-analysis")
+        assert response.status_code == 200
+        payload = response.json()
+        assert "found" in payload
 
     def test_auto_approve_enable_sweeps_pending_approvals(self, monkeypatch):
         """Enabling auto-approve should immediately process existing pending proposals."""

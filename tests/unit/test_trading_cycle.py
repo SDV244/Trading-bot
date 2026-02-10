@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import func, select
@@ -249,6 +250,49 @@ async def test_global_stop_loss_triggers_emergency_stop(
     assert result.executed is False
     assert result.risk_reason == "stop_loss_global_equity_triggered"
     assert state_module.get_state_manager().state.value == "emergency_stop"
+
+
+@pytest.mark.asyncio
+async def test_live_global_stop_loss_uses_exchange_equity_snapshot(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_LIVE_MODE", "true")
+    monkeypatch.setenv("BINANCE_API_KEY", "key")
+    monkeypatch.setenv("BINANCE_API_SECRET", "secret")
+    monkeypatch.setenv("TRADING_STOP_LOSS_ENABLED", "true")
+    monkeypatch.setenv("TRADING_STOP_LOSS_GLOBAL_EQUITY_PCT", "0.10")
+    monkeypatch.setenv("TRADING_STOP_LOSS_MAX_DRAWDOWN_PCT", "0.20")
+    monkeypatch.setenv("TRADING_PAPER_STARTING_EQUITY", "1000")
+    reload_settings()
+
+    await _seed_candles(db_session, "1h", 120, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 120, Decimal("45000"), Decimal("50"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    position = await service._get_or_create_position(db_session)  # noqa: SLF001
+    mark_price = Decimal("50000")
+
+    mock_live_adapter = AsyncMock()
+    mock_live_adapter.get_account_balances.return_value = {
+        "BTC": Decimal("1.0"),
+        "USDT": Decimal("10000"),
+    }
+    mock_spot_adapter = AsyncMock()
+    mock_spot_adapter.get_ticker_price.return_value = Decimal("70000")
+
+    with patch("packages.adapters.binance_live.get_binance_live_adapter", return_value=mock_live_adapter), patch(
+        "packages.adapters.binance_spot.get_binance_adapter", return_value=mock_spot_adapter
+    ):
+        result = await service._check_global_stop_loss(  # noqa: SLF001
+            session=db_session,
+            position=position,
+            mark_price=mark_price,
+        )
+
+    assert result is None
+    assert state_module.get_state_manager().state.value == "running"
 
 
 @pytest.mark.asyncio

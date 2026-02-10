@@ -12,6 +12,9 @@ class TestSettings:
         """Default settings are applied correctly."""
         # Clear any existing env vars
         monkeypatch.delenv("BINANCE_API_KEY", raising=False)
+        monkeypatch.setenv("TRADING_LIVE_MODE", "false")
+        monkeypatch.setenv("BINANCE_TESTNET", "false")
+        monkeypatch.setenv("BINANCE_MARKET_DATA_BASE_URL", "https://data-api.binance.vision")
         monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "trend_ema")
         monkeypatch.setenv("TRADING_ADVISOR_INTERVAL_CYCLES", "30")
         monkeypatch.setenv("TRADING_SPOT_POSITION_MODE", "long_flat")
@@ -30,6 +33,10 @@ class TestSettings:
         monkeypatch.setenv("RISK_PER_TRADE", "0.005")
         monkeypatch.setenv("RISK_MAX_DAILY_LOSS", "0.02")
         monkeypatch.setenv("RISK_MAX_EXPOSURE", "0.25")
+        monkeypatch.setenv("LLM_ENABLED", "false")
+        monkeypatch.setenv("LLM_PROVIDER", "openai")
+        monkeypatch.setenv("LLM_MODEL", "gpt-4.1-mini")
+        monkeypatch.setenv("MULTIAGENT_ENABLED", "false")
 
         # Reset cached settings
         import packages.core.config as config_module
@@ -60,6 +67,12 @@ class TestSettings:
         assert settings.trading.grid_min_net_profit_bps == 30
         assert settings.trading.grid_out_of_bounds_alert_cooldown_minutes == 60
         assert settings.trading.grid_recenter_mode == "aggressive"
+        assert settings.trading.regime_adaptation_enabled is True
+        assert settings.trading.inventory_profit_levels_list == (
+            (0.015, 0.25),
+            (0.025, 0.5),
+            (0.04, 1.0),
+        )
         assert settings.trading.stop_loss_enabled is True
         assert settings.trading.stop_loss_global_equity_pct == 0.15
         assert settings.trading.stop_loss_max_drawdown_pct == 0.20
@@ -67,14 +80,21 @@ class TestSettings:
         assert settings.trading.advisor_interval_cycles == 30
         assert settings.trading.paper_starting_equity == 10000.0
         assert settings.risk.per_trade == 0.005
+        assert settings.risk.min_per_trade == 0.001
+        assert settings.risk.max_per_trade == 0.02
+        assert settings.risk.dynamic_sizing_enabled is True
         assert settings.risk.max_daily_loss == 0.02
         assert settings.approval.timeout_hours == 2
         assert settings.approval.auto_approve_enabled is False
+        assert settings.approval.emergency_ai_enabled is True
+        assert settings.approval.emergency_max_proposals == 3
         assert settings.llm.enabled is False
         assert settings.llm.provider == "openai"
         assert settings.llm.model == "gpt-4.1-mini"
         assert settings.llm.prefer_llm is True
         assert settings.llm.fallback_to_rules is True
+        assert settings.multiagent.enabled is False
+        assert settings.multiagent.max_proposals == 5
 
     def test_timeframes_parsing(self, monkeypatch):
         """Timeframes string is parsed correctly."""
@@ -103,6 +123,7 @@ class TestSettings:
     def test_binance_production_url(self, monkeypatch):
         """Production URLs are returned when testnet is disabled."""
         monkeypatch.setenv("BINANCE_TESTNET", "false")
+        monkeypatch.setenv("BINANCE_MARKET_DATA_BASE_URL", "https://data-api.binance.vision")
 
         import packages.core.config as config_module
 
@@ -165,6 +186,11 @@ class TestSettings:
         monkeypatch.setenv("TRADING_GRID_MIN_NET_PROFIT_BPS", "40")
         monkeypatch.setenv("TRADING_GRID_OUT_OF_BOUNDS_ALERT_COOLDOWN_MINUTES", "30")
         monkeypatch.setenv("TRADING_GRID_RECENTER_MODE", "conservative")
+        monkeypatch.setenv("TRADING_REGIME_ADAPTATION_ENABLED", "false")
+        monkeypatch.setenv("TRADING_INVENTORY_PROFIT_LEVELS", "0.02:0.5,0.05:1")
+        monkeypatch.setenv("TRADING_INVENTORY_TRAILING_STOP_PCT", "0.03")
+        monkeypatch.setenv("TRADING_INVENTORY_TIME_STOP_HOURS", "72")
+        monkeypatch.setenv("TRADING_INVENTORY_MIN_PROFIT_FOR_TIME_STOP", "0.01")
         monkeypatch.setenv("TRADING_STOP_LOSS_ENABLED", "true")
         monkeypatch.setenv("TRADING_STOP_LOSS_GLOBAL_EQUITY_PCT", "0.12")
         monkeypatch.setenv("TRADING_STOP_LOSS_MAX_DRAWDOWN_PCT", "0.18")
@@ -192,6 +218,11 @@ class TestSettings:
         assert settings.trading.grid_min_net_profit_bps == 40
         assert settings.trading.grid_out_of_bounds_alert_cooldown_minutes == 30
         assert settings.trading.grid_recenter_mode == "conservative"
+        assert settings.trading.regime_adaptation_enabled is False
+        assert settings.trading.inventory_profit_levels_list == ((0.02, 0.5), (0.05, 1.0))
+        assert settings.trading.inventory_trailing_stop_pct == 0.03
+        assert settings.trading.inventory_time_stop_hours == 72
+        assert settings.trading.inventory_min_profit_for_time_stop == 0.01
         assert settings.trading.stop_loss_enabled is True
         assert settings.trading.stop_loss_global_equity_pct == 0.12
         assert settings.trading.stop_loss_max_drawdown_pct == 0.18
@@ -225,12 +256,16 @@ class TestSettings:
     def test_approval_auto_approve_override(self, monkeypatch):
         """Approval auto-approve can be overridden from env."""
         monkeypatch.setenv("APPROVAL_AUTO_APPROVE_ENABLED", "true")
+        monkeypatch.setenv("APPROVAL_EMERGENCY_AI_ENABLED", "false")
+        monkeypatch.setenv("APPROVAL_EMERGENCY_MAX_PROPOSALS", "5")
 
         import packages.core.config as config_module
 
         config_module._settings = None
         settings = config_module.get_settings()
         assert settings.approval.auto_approve_enabled is True
+        assert settings.approval.emergency_ai_enabled is False
+        assert settings.approval.emergency_max_proposals == 5
         config_module.reload_settings()
 
     def test_llm_settings_override(self, monkeypatch):
@@ -256,3 +291,21 @@ class TestSettings:
         assert settings.llm.min_confidence == 0.65
         assert settings.llm.prefer_llm is True
         assert settings.llm.fallback_to_rules is False
+
+    def test_multiagent_settings_override(self, monkeypatch):
+        """Multi-agent settings can be overridden from env."""
+        monkeypatch.setenv("MULTIAGENT_ENABLED", "true")
+        monkeypatch.setenv("MULTIAGENT_MAX_PROPOSALS", "7")
+        monkeypatch.setenv("MULTIAGENT_MIN_CONFIDENCE", "0.6")
+        monkeypatch.setenv("MULTIAGENT_META_AGENT_ENABLED", "false")
+        monkeypatch.setenv("MULTIAGENT_SENTIMENT_AGENT_ENABLED", "false")
+
+        import packages.core.config as config_module
+
+        config_module._settings = None
+        settings = config_module.get_settings()
+        assert settings.multiagent.enabled is True
+        assert settings.multiagent.max_proposals == 7
+        assert settings.multiagent.min_confidence == 0.6
+        assert settings.multiagent.meta_agent_enabled is False
+        assert settings.multiagent.sentiment_agent_enabled is False

@@ -326,6 +326,27 @@ class BinanceSpotAdapter:
 
         raise ValueError(f"Symbol {symbol} not found")
 
+    async def get_order_book(self, symbol: str = "BTCUSDT", limit: int = 20) -> dict[str, Any]:
+        """
+        Get order book depth snapshot.
+
+        Args:
+            symbol: Trading pair symbol
+            limit: Depth levels (5, 10, 20, 50, 100, 500, 1000, 5000)
+        """
+        valid_limits = {5, 10, 20, 50, 100, 500, 1000, 5000}
+        resolved_limit = limit if limit in valid_limits else 20
+        data = await self._request_with_retry(
+            "GET",
+            "/api/v3/depth",
+            params={"symbol": symbol, "limit": resolved_limit},
+            max_retries=self._max_retries,
+            weight=5,
+        )
+        if not isinstance(data, dict):
+            raise ValueError("Invalid order book response")
+        return cast(JSONDict, data)
+
     def get_circuit_breaker_stats(self) -> dict[str, Any]:
         """Expose current circuit-breaker state for diagnostics."""
         return self._circuit_breaker.get_stats()

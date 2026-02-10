@@ -196,6 +196,26 @@ async def run_reconciliation_guard(
         actor=actor,
     )
 
+    if emergency_stop_triggered:
+        try:
+            from packages.core.ai import get_emergency_stop_analyzer
+
+            await get_emergency_stop_analyzer().analyze_and_enqueue(
+                session,
+                reason="balance_reconciliation_critical_mismatch",
+                source="reconciliation_guard",
+                metadata={
+                    "mode": result.mode,
+                    "difference": str(result.difference),
+                    "warning_tolerance": str(warning_tolerance),
+                    "critical_tolerance": str(critical_tolerance),
+                },
+                actor=actor,
+            )
+        except Exception:  # noqa: BLE001
+            # Do not break reconciliation guard if AI analysis fails.
+            pass
+
     return ReconciliationGuardResult(
         result=result,
         event_type=event_type,

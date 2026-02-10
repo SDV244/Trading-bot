@@ -142,6 +142,19 @@ export type Position = {
   is_paper: boolean;
 };
 
+export type Funds = {
+  symbol: string;
+  base_asset: string;
+  quote_asset: string;
+  base_balance: string;
+  quote_balance: string;
+  mark_price: string;
+  base_quote_value: string;
+  estimated_total_equity: string;
+  is_paper: boolean;
+  source: string;
+};
+
 export type Metrics = {
   total_trades: number;
   winning_trades: number;
@@ -186,17 +199,38 @@ export type TradingConfig = {
   grid_min_net_profit_bps: number;
   grid_out_of_bounds_alert_cooldown_minutes: number;
   grid_recenter_mode: "conservative" | "aggressive";
+  regime_adaptation_enabled: boolean;
+  inventory_profit_levels: string;
+  inventory_trailing_stop_pct: number;
+  inventory_time_stop_hours: number;
+  inventory_min_profit_for_time_stop: number;
   stop_loss_enabled: boolean;
   stop_loss_global_equity_pct: number;
   stop_loss_max_drawdown_pct: number;
   stop_loss_auto_close_positions: boolean;
   risk_per_trade: number;
+  risk_min_per_trade: number;
+  risk_max_per_trade: number;
+  risk_dynamic_sizing_enabled: boolean;
+  risk_confidence_sizing_enabled: boolean;
+  risk_regime_sizing_enabled: boolean;
+  risk_drawdown_scaling_enabled: boolean;
+  risk_drawdown_tier1_pct: number;
+  risk_drawdown_tier1_mult: number;
+  risk_drawdown_tier2_pct: number;
+  risk_drawdown_tier2_mult: number;
+  risk_drawdown_tier3_pct: number;
+  risk_drawdown_tier3_mult: number;
   max_daily_loss: number;
   max_exposure: number;
   fee_bps: number;
   slippage_bps: number;
   approval_timeout_hours: number;
   approval_auto_approve_enabled: boolean;
+  multiagent_enabled: boolean;
+  multiagent_max_proposals: number;
+  multiagent_min_confidence: number;
+  multiagent_meta_agent_enabled: boolean;
 };
 
 export type Order = {
@@ -283,6 +317,26 @@ export type Approval = {
 export type AutoApproveStatus = {
   enabled: boolean;
   decided_by: string;
+};
+
+export type MultiAgentStatus = {
+  enabled: boolean;
+  max_proposals: number;
+  min_confidence: number;
+  meta_agent_enabled: boolean;
+  strategy_agent_enabled: boolean;
+  risk_agent_enabled: boolean;
+  market_agent_enabled: boolean;
+  execution_agent_enabled: boolean;
+  sentiment_agent_enabled: boolean;
+};
+
+export type MultiAgentTestResult = {
+  ok: boolean;
+  enabled: boolean;
+  message: string;
+  agents_used: string[];
+  proposal_count: number;
 };
 
 export type AuditEvent = {
@@ -467,6 +521,7 @@ export const api = {
       body: JSON.stringify({ mode, reason, changed_by: "web_dashboard" }),
     }),
   getPosition: () => fetchJson<Position>("/api/trading/position"),
+  getFunds: () => fetchJson<Funds>("/api/trading/funds"),
   getGridPreview: () => fetchJson<GridPreview | null>("/api/trading/grid/preview"),
   getMetrics: () => fetchJson<Metrics>("/api/trading/metrics"),
   getOrders: (limit = 10, status?: string) =>
@@ -485,6 +540,11 @@ export const api = {
     fetchJson<AutoApproveStatus>("/api/ai/auto-approve", {
       method: "POST",
       body: JSON.stringify({ enabled, reason, changed_by: "web_dashboard" }),
+    }),
+  getMultiAgentStatus: () => fetchJson<MultiAgentStatus>("/api/ai/multi-agent/status"),
+  testMultiAgent: () =>
+    fetchJson<MultiAgentTestResult>("/api/ai/multi-agent/test", {
+      method: "POST",
     }),
   generateProposals: () =>
     fetchJson<Approval[]>("/api/ai/proposals/generate", {

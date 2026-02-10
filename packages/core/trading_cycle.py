@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, ROUND_UP, Decimal
-from typing import Literal, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -23,12 +23,16 @@ from packages.core.database.models import (
     Position,
 )
 from packages.core.database.repositories import CandleRepository
-from packages.core.execution.paper_engine import (
+from packages.core.execution import (
+    LiveEngine,
+    LiveEngineError,
+    LiveSafetyChecklist,
     OrderRequest,
     PaperEngine,
     PaperExecutionError,
     PaperFill,
 )
+from packages.core.inventory_manager import InventoryDecision, InventoryManager
 from packages.core.metrics.calculator import MetricsCalculator
 from packages.core.risk.engine import RiskConfig, RiskEngine, RiskInput
 from packages.core.risk.global_stop_loss import GlobalStopLossConfig, GlobalStopLossGuard
@@ -116,6 +120,7 @@ class TradingCycleService:
     def __init__(self) -> None:
         settings = get_settings()
         self.settings = settings
+        self.is_paper_mode = not settings.trading.live_mode
         self.symbol = settings.trading.pair
         self.spot_position_mode = settings.trading.spot_position_mode.strip().lower()
         self.timing_timeframe, self.regime_timeframe = self._resolve_strategy_timeframes(
@@ -126,10 +131,22 @@ class TradingCycleService:
         self.risk_engine = RiskEngine(
             RiskConfig(
                 risk_per_trade=Decimal(str(settings.risk.per_trade)),
+                min_risk_per_trade=Decimal(str(settings.risk.min_per_trade)),
+                max_risk_per_trade=Decimal(str(settings.risk.max_per_trade)),
                 max_daily_loss=Decimal(str(settings.risk.max_daily_loss)),
                 max_exposure=Decimal(str(settings.risk.max_exposure)),
                 fee_bps=settings.risk.fee_bps,
                 slippage_bps=settings.risk.slippage_bps,
+                dynamic_sizing_enabled=settings.risk.dynamic_sizing_enabled,
+                confidence_sizing_enabled=settings.risk.confidence_sizing_enabled,
+                regime_sizing_enabled=settings.risk.regime_sizing_enabled,
+                drawdown_scaling_enabled=settings.risk.drawdown_scaling_enabled,
+                drawdown_tier1_pct=Decimal(str(settings.risk.drawdown_tier1_pct)),
+                drawdown_tier1_mult=Decimal(str(settings.risk.drawdown_tier1_mult)),
+                drawdown_tier2_pct=Decimal(str(settings.risk.drawdown_tier2_pct)),
+                drawdown_tier2_mult=Decimal(str(settings.risk.drawdown_tier2_mult)),
+                drawdown_tier3_pct=Decimal(str(settings.risk.drawdown_tier3_pct)),
+                drawdown_tier3_mult=Decimal(str(settings.risk.drawdown_tier3_mult)),
             )
         )
         self.paper_engine = PaperEngine(
@@ -137,6 +154,9 @@ class TradingCycleService:
             slippage_bps=settings.risk.slippage_bps,
             allowed_symbols={self.symbol},
         )
+        self.live_engine: LiveEngine | None = None
+        if not self.is_paper_mode:
+            self.live_engine = LiveEngine()
         self.stop_loss_guard = GlobalStopLossGuard(
             GlobalStopLossConfig(
                 enabled=settings.trading.stop_loss_enabled,
@@ -147,11 +167,17 @@ class TradingCycleService:
         )
         self.starting_equity = Decimal(str(settings.trading.paper_starting_equity))
         self.grid_cooldown_seconds = max(0, settings.trading.grid_cooldown_seconds)
+        self.inventory_manager = InventoryManager(
+            profit_levels=settings.trading.inventory_profit_levels_list,
+            trailing_stop_pct=settings.trading.inventory_trailing_stop_pct,
+            time_stop_hours=settings.trading.inventory_time_stop_hours,
+            min_profit_for_time_stop=settings.trading.inventory_min_profit_for_time_stop,
+        )
         self._last_out_of_bounds_alert_at: datetime | None = None
 
     def _build_strategy(self, strategy_name: str) -> Strategy:
         try:
-            if strategy_name == "smart_grid_ai":
+            if strategy_name in {"smart_grid_ai", "enhanced_smart_grid"}:
                 return registry.create(
                     strategy_name,
                     lookback_1h=self.settings.trading.grid_lookback_1h,
@@ -165,6 +191,7 @@ class TradingCycleService:
                     take_profit_buffer=self.settings.trading.grid_take_profit_buffer,
                     stop_loss_buffer=self.settings.trading.grid_stop_loss_buffer,
                     recenter_mode=self.settings.trading.grid_recenter_mode,
+                    regime_adaptation_enabled=self.settings.trading.regime_adaptation_enabled,
                 )
             return registry.create(strategy_name)
         except ValueError as exc:
@@ -177,7 +204,7 @@ class TradingCycleService:
         if normalized not in {"conservative", "aggressive"}:
             raise ValueError("mode must be 'conservative' or 'aggressive'")
         self.settings.trading.grid_recenter_mode = normalized
-        if self.strategy.name == "smart_grid_ai":
+        if self.strategy.name in {"smart_grid_ai", "enhanced_smart_grid"}:
             self.strategy.recenter_mode = normalized  # type: ignore[attr-defined]
         return normalized
 
@@ -198,6 +225,29 @@ class TradingCycleService:
         for timeframe in self.settings.trading.timeframe_list:
             requirements.setdefault(timeframe, 0)
         return requirements
+
+    @staticmethod
+    def _split_symbol_assets(symbol: str) -> tuple[str, str]:
+        """Infer base/quote assets from a spot symbol."""
+        quote_candidates = (
+            "USDT",
+            "FDUSD",
+            "USDC",
+            "BUSD",
+            "TUSD",
+            "BTC",
+            "ETH",
+            "BNB",
+            "TRY",
+            "EUR",
+            "BRL",
+        )
+        for quote_asset in quote_candidates:
+            if symbol.endswith(quote_asset) and len(symbol) > len(quote_asset):
+                return symbol[: -len(quote_asset)], quote_asset
+        if len(symbol) <= 4:
+            return symbol, ""
+        return symbol[:-4], symbol[-4:]
 
     def _resolve_strategy_timeframes(self, configured: list[str]) -> tuple[str, str]:
         if not configured:
@@ -223,7 +273,10 @@ class TradingCycleService:
                 reasons.append(f"{timeframe}: requires {required} candles, found {available}")
 
         data_ready = all(item.ready for item in readiness.values())
-        if self.strategy.name == "smart_grid_ai" and self.settings.trading.grid_enforce_fee_floor:
+        if (
+            self.strategy.name in {"smart_grid_ai", "enhanced_smart_grid"}
+            and self.settings.trading.grid_enforce_fee_floor
+        ):
             round_trip_cost_bps = (self.settings.risk.fee_bps * 2) + (self.settings.risk.slippage_bps * 2)
             min_net_bps = self.settings.trading.grid_min_spacing_bps - round_trip_cost_bps
             required_net_bps = self.settings.trading.grid_min_net_profit_bps
@@ -252,7 +305,7 @@ class TradingCycleService:
 
     async def get_grid_preview(self, session: AsyncSession) -> GridPreview | None:
         """Build smart-grid level preview for operator visibility."""
-        if self.strategy.name != "smart_grid_ai":
+        if self.strategy.name not in {"smart_grid_ai", "enhanced_smart_grid"}:
             return None
 
         context = await self._load_strategy_context(session)
@@ -266,7 +319,7 @@ class TradingCycleService:
         position_result = await session.execute(
             select(Position).where(
                 Position.symbol == self.symbol,
-                Position.is_paper.is_(True),
+                Position.is_paper.is_(self.is_paper_mode),
             )
         )
         position = position_result.scalar_one_or_none()
@@ -324,14 +377,14 @@ class TradingCycleService:
         )
 
     @staticmethod
-    def _float_indicator(indicators: dict[str, float], key: str) -> float | None:
+    def _float_indicator(indicators: dict[str, Any], key: str) -> float | None:
         raw = indicators.get(key)
         if isinstance(raw, int | float):
             return float(raw)
         return None
 
     @classmethod
-    def _decimal_indicator(cls, indicators: dict[str, float], key: str) -> Decimal | None:
+    def _decimal_indicator(cls, indicators: dict[str, Any], key: str) -> Decimal | None:
         raw = cls._float_indicator(indicators, key)
         if raw is None:
             return None
@@ -339,7 +392,7 @@ class TradingCycleService:
 
     @staticmethod
     def _extract_grid_levels(
-        indicators: dict[str, float],
+        indicators: dict[str, Any],
         prefix: str,
         reference_price: Decimal,
     ) -> list[GridLevel]:
@@ -411,6 +464,39 @@ class TradingCycleService:
 
         signal = self.strategy.generate_signal(context)
         await self._maybe_alert_out_of_bounds(session, signal, last_price)
+        forced_sell_quantity: Decimal | None = None
+        if position.quantity > 0:
+            inventory_decision = await self._evaluate_inventory_management(
+                session=session,
+                position=position,
+                mark_price=last_price,
+            )
+            if inventory_decision is not None and inventory_decision.action != "HOLD":
+                forced_sell_quantity = max(Decimal("0"), Decimal(str(position.quantity)) - inventory_decision.target_quantity)
+                if forced_sell_quantity > 0:
+                    indicators = dict(signal.indicators)
+                    indicators["inventory_reduce_fraction"] = float(inventory_decision.reduce_fraction)
+                    indicators["inventory_urgency"] = float(inventory_decision.urgency)
+                    indicators["inventory_target_quantity"] = float(inventory_decision.target_quantity)
+                    indicators["inventory_forced_sell_quantity"] = float(forced_sell_quantity)
+                    signal = Signal(
+                        side="SELL",
+                        confidence=max(signal.confidence, 0.90),
+                        reason=inventory_decision.reason,
+                        indicators=indicators,
+                    )
+                    await log_event(
+                        session,
+                        event_type="inventory_manager_override",
+                        event_category="risk",
+                        summary=f"Inventory manager forced SELL ({inventory_decision.reason})",
+                        details={
+                            "action": inventory_decision.action,
+                            "urgency": inventory_decision.urgency,
+                            "target_quantity": str(inventory_decision.target_quantity),
+                            "forced_sell_quantity": str(forced_sell_quantity),
+                        },
+                    )
         if position.quantity <= 0:
             bootstrap = await self._maybe_bootstrap_inventory(
                 session=session,
@@ -473,6 +559,7 @@ class TradingCycleService:
                 daily_realized_pnl=daily_pnl,
                 current_exposure_notional=current_exposure,
                 price=last_price,
+                peak_equity=await self._get_peak_equity(session),
             ),
         )
 
@@ -523,7 +610,9 @@ class TradingCycleService:
 
         quantity = risk_decision.quantity
         if trade_side == "SELL":
-            if self.spot_position_mode == "long_flat":
+            if forced_sell_quantity is not None and forced_sell_quantity > 0:
+                quantity = min(forced_sell_quantity, position.quantity)
+            elif self.spot_position_mode == "long_flat":
                 quantity = Decimal(str(position.quantity))
             else:
                 quantity = min(quantity, position.quantity)
@@ -602,7 +691,16 @@ class TradingCycleService:
     ) -> CycleResult | None:
         if not self.stop_loss_guard.config.enabled:
             return None
-        current_equity = self._compute_equity_from_position(position=position, mark_price=mark_price)
+        if self.is_paper_mode:
+            current_equity = self._compute_equity_from_position(position=position, mark_price=mark_price)
+        else:
+            try:
+                current_equity, _available_balance = await self._resolve_live_equity(
+                    fallback_mark_price=mark_price
+                )
+            except Exception:
+                # Fallback to last persisted equity if exchange snapshot is temporarily unavailable.
+                current_equity = await self._get_current_equity(session)
         peak_equity = await self._get_peak_equity(session)
         decision = self.stop_loss_guard.evaluate(
             current_equity=current_equity,
@@ -643,6 +741,27 @@ class TradingCycleService:
             },
             actor="global_stop_loss",
         )
+        try:
+            from packages.core.ai import get_emergency_stop_analyzer
+
+            await get_emergency_stop_analyzer().analyze_and_enqueue(
+                session,
+                reason=decision.reason,
+                source="global_stop_loss",
+                metadata={
+                    "symbol": self.symbol,
+                    "trigger_type": decision.trigger_type.value if decision.trigger_type else None,
+                    "current_equity": str(decision.current_equity),
+                    "starting_equity": str(decision.starting_equity),
+                    "peak_equity": str(decision.peak_equity),
+                    "loss_pct": float(decision.loss_pct),
+                    "drawdown_pct": float(decision.drawdown_pct),
+                },
+                actor="global_stop_loss",
+            )
+        except Exception:  # noqa: BLE001
+            # Never block emergency-stop handling if AI analysis fails.
+            pass
         notifier = get_telegram_notifier()
         await notifier.send_critical_alert(
             "Global stop-loss triggered",
@@ -695,7 +814,7 @@ class TradingCycleService:
         signal: Signal,
         mark_price: Decimal,
     ) -> None:
-        if self.strategy.name != "smart_grid_ai":
+        if self.strategy.name not in {"smart_grid_ai", "enhanced_smart_grid"}:
             return
         if signal.reason != "grid_recenter_wait" and not signal.reason.startswith("grid_recentered_auto"):
             return
@@ -754,10 +873,22 @@ class TradingCycleService:
         signal_reason: str,
         risk_action: str,
         risk_reason: str,
-        signal_indicators: dict[str, float] | None = None,
+        signal_indicators: dict[str, Any] | None = None,
         candle_low: Decimal | None = None,
         candle_high: Decimal | None = None,
     ) -> CycleResult:
+        if not self.is_paper_mode:
+            return await self._execute_live_trade(
+                session=session,
+                position=position,
+                trade_side=trade_side,
+                quantity=quantity,
+                mark_price=mark_price,
+                signal_reason=signal_reason,
+                risk_action=risk_action,
+                risk_reason=risk_reason,
+            )
+
         fill, order_type = self._execute_preferred_fill(
             trade_side=trade_side,
             quantity=quantity,
@@ -776,7 +907,7 @@ class TradingCycleService:
             quantity=fill.filled_quantity,
             price=fill.price,
             status=fill.status,
-            is_paper=True,
+            is_paper=self.is_paper_mode,
             strategy_name=self.strategy.name,
             signal_reason=signal_reason,
             config_version=config_version,
@@ -790,7 +921,7 @@ class TradingCycleService:
             price=fill.price or Decimal("0"),
             fee=fill.fee,
             fee_asset="USDT",
-            is_paper=True,
+            is_paper=self.is_paper_mode,
             slippage_bps=float(fill.slippage_bps),
         )
         session.add(fill_model)
@@ -829,19 +960,200 @@ class TradingCycleService:
             price=str(fill.price) if fill.price else None,
         )
 
+    async def _execute_live_trade(
+        self,
+        *,
+        session: AsyncSession,
+        position: Position,
+        trade_side: Literal["BUY", "SELL"],
+        quantity: Decimal,
+        mark_price: Decimal,
+        signal_reason: str,
+        risk_action: str,
+        risk_reason: str,
+    ) -> CycleResult:
+        if self.live_engine is None:
+            raise RuntimeError("Live engine is not initialized")
+
+        checklist = LiveSafetyChecklist(
+            ui_confirmed=True,
+            reauthenticated=True,
+            safety_acknowledged=True,
+        )
+        client_order_id = f"sched_{uuid4().hex[:24]}"
+        try:
+            result = await self.live_engine.execute_market_order(
+                OrderRequest(
+                    symbol=self.symbol,
+                    side=trade_side,
+                    quantity=quantity,
+                    order_type="MARKET",
+                ),
+                checklist=checklist,
+                client_order_id=client_order_id,
+            )
+        except LiveEngineError as exc:
+            await log_event(
+                session,
+                event_type="live_trade_rejected",
+                event_category="trade",
+                summary=f"Live {trade_side} rejected: {exc}",
+                details={
+                    "signal_reason": signal_reason,
+                    "risk_reason": risk_reason,
+                    "quantity": str(quantity),
+                },
+            )
+            await self._persist_cycle_snapshot(
+                session=session,
+                position=position,
+                mark_price=mark_price,
+            )
+            return self._build_hold_result(
+                symbol=self.symbol,
+                signal_side=trade_side,
+                signal_reason=signal_reason,
+                risk_reason=f"live_rejected:{exc}",
+            )
+
+        if not result.accepted or result.quantity is None or result.quantity <= 0:
+            await log_event(
+                session,
+                event_type="live_trade_not_accepted",
+                event_category="trade",
+                summary=f"Live {trade_side} not accepted: {result.reason}",
+                details={
+                    "signal_reason": signal_reason,
+                    "risk_reason": risk_reason,
+                    "quantity": str(quantity),
+                    "exchange_order_id": result.order_id,
+                },
+            )
+            await self._persist_cycle_snapshot(
+                session=session,
+                position=position,
+                mark_price=mark_price,
+            )
+            return CycleResult(
+                symbol=self.symbol,
+                signal_side=trade_side,
+                signal_reason=signal_reason,
+                risk_action="HOLD",
+                risk_reason=result.reason,
+                executed=False,
+                order_id=None,
+                fill_id=None,
+                quantity="0",
+                price=None,
+            )
+
+        executed_qty = Decimal(str(result.quantity))
+        executed_price = Decimal(str(result.price)) if result.price is not None else mark_price
+        executed_notional = executed_qty * executed_price
+        executed_fee = (
+            executed_notional * Decimal(self.settings.risk.fee_bps) / Decimal("10000")
+        ).quantize(Decimal("0.00000001"))
+        slippage_bps = 0
+        if mark_price > 0:
+            if trade_side == "BUY":
+                slippage_bps = int((executed_price - mark_price) / mark_price * Decimal("10000"))
+            else:
+                slippage_bps = int((mark_price - executed_price) / mark_price * Decimal("10000"))
+
+        fill = PaperFill(
+            fill_id=f"live_{uuid4().hex[:16]}",
+            symbol=self.symbol,
+            side=trade_side,
+            order_type="MARKET",
+            requested_quantity=quantity,
+            filled_quantity=executed_qty,
+            remaining_quantity=max(Decimal("0"), quantity - executed_qty),
+            price=executed_price,
+            fee=executed_fee,
+            notional=executed_notional,
+            slippage_bps=slippage_bps,
+            status="FILLED",
+            reason=result.reason,
+        )
+
+        config_version = await resolve_active_config_version(session)
+        order = Order(
+            client_order_id=result.client_order_id or client_order_id,
+            exchange_order_id=result.order_id,
+            symbol=self.symbol,
+            side=trade_side,
+            order_type="MARKET",
+            quantity=fill.filled_quantity,
+            price=fill.price,
+            status=fill.status,
+            is_paper=self.is_paper_mode,
+            strategy_name=self.strategy.name,
+            signal_reason=signal_reason,
+            config_version=config_version,
+        )
+        session.add(order)
+        await session.flush()
+
+        fill_model = Fill(
+            order_id=order.id,
+            fill_id=fill.fill_id,
+            quantity=fill.filled_quantity,
+            price=fill.price or Decimal("0"),
+            fee=fill.fee,
+            fee_asset="USDT",
+            is_paper=self.is_paper_mode,
+            slippage_bps=float(fill.slippage_bps),
+        )
+        session.add(fill_model)
+
+        self._apply_fill_to_position(position, fill)
+        session.add(position)
+        await self._persist_cycle_snapshot(
+            session=session,
+            position=position,
+            mark_price=(fill.price or mark_price),
+        )
+        await log_event(
+            session,
+            event_type="live_trade_executed",
+            event_category="trade",
+            summary=f"{trade_side} {fill.filled_quantity} {self.symbol} at {fill.price}",
+            details={
+                "order_id": order.id,
+                "fill_id": fill.fill_id,
+                "signal_reason": signal_reason,
+                "risk_reason": risk_reason,
+                "fee": str(fill.fee),
+                "exchange_order_id": result.order_id,
+            },
+            config_version=config_version,
+        )
+        return CycleResult(
+            symbol=self.symbol,
+            signal_side=trade_side,
+            signal_reason=signal_reason,
+            risk_action=risk_action,
+            risk_reason=risk_reason,
+            executed=True,
+            order_id=order.id,
+            fill_id=fill.fill_id,
+            quantity=str(fill.filled_quantity),
+            price=str(fill.price) if fill.price else None,
+        )
+
     def _execute_preferred_fill(
         self,
         *,
         trade_side: Literal["BUY", "SELL"],
         quantity: Decimal,
         mark_price: Decimal,
-        signal_indicators: dict[str, float] | None,
+        signal_indicators: dict[str, Any] | None,
         candle_low: Decimal | None,
         candle_high: Decimal | None,
     ) -> tuple[PaperFill, Literal["LIMIT", "MARKET"]]:
         """Prefer maker-like limit fills for smart-grid, fallback to market fill."""
         if (
-            self.strategy.name == "smart_grid_ai"
+            self.strategy.name in {"smart_grid_ai", "enhanced_smart_grid"}
             and signal_indicators is not None
             and candle_low is not None
             and candle_high is not None
@@ -873,6 +1185,46 @@ class TradingCycleService:
             last_price=mark_price,
         )
         return market_fill, "MARKET"
+
+    async def _evaluate_inventory_management(
+        self,
+        *,
+        session: AsyncSession,
+        position: Position,
+        mark_price: Decimal,
+    ) -> InventoryDecision | None:
+        quantity = Decimal(str(position.quantity))
+        avg_entry = Decimal(str(position.avg_entry_price))
+        if quantity <= 0 or avg_entry <= 0:
+            return None
+        hours_open = await self._hours_in_open_position(session)
+        decision = self.inventory_manager.evaluate(
+            current_price=mark_price,
+            avg_entry=avg_entry,
+            current_quantity=quantity,
+            hours_in_position=hours_open,
+        )
+        return decision
+
+    async def _hours_in_open_position(self, session: AsyncSession) -> int:
+        result = await session.execute(
+            select(Fill.filled_at)
+            .join(Order, Fill.order_id == Order.id)
+            .where(
+                Fill.is_paper.is_(self.is_paper_mode),
+                Order.symbol == self.symbol,
+                Order.side == "BUY",
+            )
+            .order_by(Fill.filled_at.desc())
+            .limit(1)
+        )
+        opened_at = result.scalar_one_or_none()
+        if opened_at is None:
+            return 0
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=UTC)
+        delta = datetime.now(UTC) - opened_at
+        return max(0, int(delta.total_seconds() // 3600))
 
     async def _maybe_bootstrap_inventory(
         self,
@@ -974,7 +1326,7 @@ class TradingCycleService:
         signal_reason: str,
         current_quantity: Decimal,
     ) -> bool:
-        if self.strategy.name != "smart_grid_ai":
+        if self.strategy.name not in {"smart_grid_ai", "enhanced_smart_grid"}:
             return False
         if not self.settings.trading.grid_auto_inventory_bootstrap:
             return False
@@ -996,7 +1348,7 @@ class TradingCycleService:
         result = await session.execute(
             select(Fill.id)
             .join(Order, Fill.order_id == Order.id)
-            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .where(Fill.is_paper.is_(self.is_paper_mode), Order.symbol == self.symbol)
             .limit(1)
         )
         return result.scalar_one_or_none() is not None
@@ -1060,7 +1412,7 @@ class TradingCycleService:
         result = await session.execute(
             select(Position).where(
                 Position.symbol == self.symbol,
-                Position.is_paper.is_(True),
+                Position.is_paper.is_(self.is_paper_mode),
             )
         )
         position = result.scalar_one_or_none()
@@ -1075,7 +1427,7 @@ class TradingCycleService:
             unrealized_pnl=Decimal("0"),
             realized_pnl=Decimal("0"),
             total_fees=Decimal("0"),
-            is_paper=True,
+            is_paper=self.is_paper_mode,
         )
         session.add(position)
         await session.flush()
@@ -1083,7 +1435,7 @@ class TradingCycleService:
 
     async def _get_current_equity(self, session: AsyncSession) -> Decimal:
         result = await session.execute(
-            select(EquitySnapshot).where(EquitySnapshot.is_paper.is_(True)).order_by(EquitySnapshot.id.desc())
+            select(EquitySnapshot).where(EquitySnapshot.is_paper.is_(self.is_paper_mode)).order_by(EquitySnapshot.id.desc())
         )
         snapshot = result.scalars().first()
         if snapshot is None:
@@ -1106,7 +1458,7 @@ class TradingCycleService:
         """Resolve global peak and optional scope anchor for mixed-baseline paper history."""
         result = await session.execute(
             select(EquitySnapshot.id, EquitySnapshot.equity)
-            .where(EquitySnapshot.is_paper.is_(True))
+            .where(EquitySnapshot.is_paper.is_(self.is_paper_mode))
             .order_by(EquitySnapshot.equity.desc(), EquitySnapshot.id.desc())
             .limit(1)
         )
@@ -1128,7 +1480,7 @@ class TradingCycleService:
         anchor_result = await session.execute(
             select(EquitySnapshot.id)
             .where(
-                EquitySnapshot.is_paper.is_(True),
+                EquitySnapshot.is_paper.is_(self.is_paper_mode),
                 EquitySnapshot.id > peak_snapshot_id,
                 EquitySnapshot.equity >= baseline_band_lower,
                 EquitySnapshot.equity <= baseline_band_upper,
@@ -1150,7 +1502,7 @@ class TradingCycleService:
 
         scoped_peak_result = await session.execute(
             select(func.max(EquitySnapshot.equity)).where(
-                EquitySnapshot.is_paper.is_(True),
+                EquitySnapshot.is_paper.is_(self.is_paper_mode),
                 EquitySnapshot.id >= anchor_snapshot_id,
             )
         )
@@ -1165,7 +1517,7 @@ class TradingCycleService:
         result = await session.execute(
             select(Fill.filled_at)
             .join(Order, Fill.order_id == Order.id)
-            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .where(Fill.is_paper.is_(self.is_paper_mode), Order.symbol == self.symbol)
             .order_by(Fill.filled_at.desc())
             .limit(1)
         )
@@ -1200,7 +1552,7 @@ class TradingCycleService:
         result = await session.execute(
             select(Fill.price)
             .join(Order, Fill.order_id == Order.id)
-            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .where(Fill.is_paper.is_(self.is_paper_mode), Order.symbol == self.symbol)
             .order_by(Fill.filled_at.desc())
             .limit(1)
         )
@@ -1217,20 +1569,51 @@ class TradingCycleService:
         mark_price: Decimal,
     ) -> None:
         """Persist equity and metrics snapshot for every analyzed cycle."""
-        equity_value = self.starting_equity + position.realized_pnl + position.unrealized_pnl
-        exposure = position.quantity * mark_price
-        available_balance = equity_value - exposure
+        if self.is_paper_mode:
+            equity_value = self.starting_equity + position.realized_pnl + position.unrealized_pnl
+            exposure = position.quantity * mark_price
+            available_balance = equity_value - exposure
+        else:
+            # In live mode, equity/available should reflect exchange wallet balances.
+            try:
+                equity_value, available_balance = await self._resolve_live_equity(
+                    fallback_mark_price=mark_price
+                )
+            except Exception:
+                # Fallback to internal estimate if exchange valuation is temporarily unavailable.
+                equity_value = self.starting_equity + position.realized_pnl + position.unrealized_pnl
+                exposure = position.quantity * mark_price
+                available_balance = equity_value - exposure
         session.add(
             EquitySnapshot(
                 equity=equity_value,
                 available_balance=available_balance,
                 unrealized_pnl=position.unrealized_pnl,
-                is_paper=True,
+                is_paper=self.is_paper_mode,
             )
         )
         await session.flush()
         metrics = await self._build_metrics_snapshot(session)
         session.add(metrics)
+
+    async def _resolve_live_equity(
+        self,
+        *,
+        fallback_mark_price: Decimal | None = None,
+    ) -> tuple[Decimal, Decimal]:
+        """Compute live-mode equity/available balance from exchange funds."""
+        from packages.adapters.binance_live import get_binance_live_adapter
+        from packages.adapters.binance_spot import get_binance_adapter
+
+        base_asset, quote_asset = self._split_symbol_assets(self.symbol)
+        balances = await get_binance_live_adapter().get_account_balances()
+        mark_price = await get_binance_adapter().get_ticker_price(self.symbol)
+        if mark_price <= 0 and fallback_mark_price is not None and fallback_mark_price > 0:
+            mark_price = fallback_mark_price
+        base_balance = Decimal(str(balances.get(base_asset, Decimal("0"))))
+        quote_balance = Decimal(str(balances.get(quote_asset, Decimal("0"))))
+        equity_value = quote_balance + (base_balance * mark_price)
+        return equity_value, quote_balance
 
     def _apply_fill_to_position(self, position: Position, fill: PaperFill) -> Decimal:
         fill_side = fill.side
@@ -1274,7 +1657,7 @@ class TradingCycleService:
         fills_result = await session.execute(
             select(Fill.filled_at, Fill.quantity, Fill.price, Fill.fee, Order.side)
             .join(Order, Fill.order_id == Order.id)
-            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .where(Fill.is_paper.is_(self.is_paper_mode), Order.symbol == self.symbol)
             .order_by(Fill.filled_at.asc(), Fill.id.asc())
         )
         running_qty = Decimal("0")
@@ -1308,7 +1691,7 @@ class TradingCycleService:
         fills_result = await session.execute(
             select(Fill.quantity, Fill.price, Fill.fee, Order.side)
             .join(Order, Fill.order_id == Order.id)
-            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .where(Fill.is_paper.is_(self.is_paper_mode), Order.symbol == self.symbol)
             .order_by(Fill.filled_at.asc(), Fill.id.asc())
         )
         running_qty = Decimal("0")
@@ -1349,25 +1732,25 @@ class TradingCycleService:
             await session.execute(
                 select(func.count(Fill.id))
                 .join(Order, Fill.order_id == Order.id)
-                .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+                .where(Fill.is_paper.is_(self.is_paper_mode), Order.symbol == self.symbol)
             )
         ).scalar_one()
         total_fees = (
             await session.execute(
                 select(func.coalesce(func.sum(Fill.fee), 0))
                 .join(Order, Fill.order_id == Order.id)
-                .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+                .where(Fill.is_paper.is_(self.is_paper_mode), Order.symbol == self.symbol)
             )
         ).scalar_one()
         position_result = await session.execute(
-            select(Position).where(Position.symbol == self.symbol, Position.is_paper.is_(True))
+            select(Position).where(Position.symbol == self.symbol, Position.is_paper.is_(self.is_paper_mode))
         )
         position = position_result.scalar_one_or_none()
         total_pnl = Decimal("0")
         if position is not None:
             total_pnl = Decimal(str(position.realized_pnl)) + Decimal(str(position.unrealized_pnl))
         _, anchor_snapshot_id = await self._resolve_paper_equity_scope(session)
-        equity_query = select(EquitySnapshot.equity).where(EquitySnapshot.is_paper.is_(True))
+        equity_query = select(EquitySnapshot.equity).where(EquitySnapshot.is_paper.is_(self.is_paper_mode))
         if anchor_snapshot_id is not None:
             equity_query = equity_query.where(EquitySnapshot.id >= anchor_snapshot_id)
         equity_query = equity_query.order_by(EquitySnapshot.snapshot_at.asc(), EquitySnapshot.id.asc())
@@ -1418,7 +1801,7 @@ class TradingCycleService:
             profit_factor=computed.profit_factor if closed_trade_count > 0 else None,
             win_rate=win_rate,
             avg_trade_pnl=avg_trade_pnl,
-            is_paper=True,
+            is_paper=self.is_paper_mode,
         )
 
 _trading_cycle_service: TradingCycleService | None = None
@@ -1440,3 +1823,4 @@ def reset_trading_cycle_service() -> None:
     global _trading_cycle_service
     with _trading_cycle_service_lock:
         _trading_cycle_service = None
+
