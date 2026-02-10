@@ -28,6 +28,8 @@ export function ApprovalsPage() {
     () => data.approvals.filter((approval) => approval.status === "PENDING"),
     [data.approvals],
   );
+  const autoApproveEnabled = data.config?.approval_auto_approve_enabled ?? false;
+  const canOperate = user?.role === "operator" || user?.role === "admin";
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
@@ -52,12 +54,54 @@ export function ApprovalsPage() {
     }
   }
 
+  async function toggleAutoApprove() {
+    try {
+      setError(null);
+      const nextEnabled = !autoApproveEnabled;
+      setMessage(`${nextEnabled ? "Enabling" : "Disabling"} auto-approve...`);
+      await api.setAutoApproveStatus(
+        nextEnabled,
+        nextEnabled ? "dashboard_enable_auto_approve" : "dashboard_disable_auto_approve",
+      );
+      await refresh();
+      setMessage(`Auto-approve ${nextEnabled ? "enabled" : "disabled"}`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Auto-approve toggle failed");
+    } finally {
+      window.setTimeout(() => setMessage(null), 1600);
+    }
+  }
+
   return (
     <section className="grid gap-4 lg:grid-cols-2">
       <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">
         <div className="flex items-center justify-between">
           <h2 className="font-heading text-lg font-bold text-white">Pending Approvals</h2>
           <span className="text-xs text-slate-300">{pending.length} pending</span>
+        </div>
+        <div className="mt-3 rounded-lg border border-white/10 bg-black/20 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <p className="text-xs text-slate-200">
+              Auto-accept AI suggestions:{" "}
+              <span className={autoApproveEnabled ? "text-emerald-200" : "text-slate-300"}>
+                {autoApproveEnabled ? "ENABLED" : "DISABLED"}
+              </span>
+            </p>
+            <button
+              className={
+                autoApproveEnabled
+                  ? "rounded border border-amber-300/50 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-100"
+                  : "rounded border border-emerald-300/50 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-200"
+              }
+              onClick={() => void toggleAutoApprove()}
+              disabled={!canOperate}
+            >
+              {autoApproveEnabled ? "Disable Auto-Approve" : "Enable Auto-Approve"}
+            </button>
+          </div>
+          <p className="mt-2 text-[11px] text-slate-400">
+            When enabled, new AI proposals are approved immediately and applied without manual clicks.
+          </p>
         </div>
         {message ? <p className="mt-3 text-xs text-mint">{message}</p> : null}
         {error ? <p className="mt-3 text-xs text-rose-200">{error}</p> : null}
@@ -76,12 +120,14 @@ export function ApprovalsPage() {
                 <button
                   className="rounded border border-emerald-300/50 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-200"
                   onClick={() => void decide(approval.id, "approve")}
+                  disabled={!canOperate}
                 >
                   Approve
                 </button>
                 <button
                   className="rounded border border-rose-300/50 bg-rose-500/10 px-2 py-1 text-[11px] text-rose-200"
                   onClick={() => void decide(approval.id, "reject")}
+                  disabled={!canOperate}
                 >
                   Reject
                 </button>
@@ -116,4 +162,3 @@ export function ApprovalsPage() {
     </section>
   );
 }
-

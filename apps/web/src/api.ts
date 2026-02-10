@@ -26,6 +26,14 @@ export type SchedulerCycleResult = {
   quantity: string;
   price: string | null;
   executed_at?: string;
+  reconciliation?: {
+    mode: "paper" | "live";
+    difference: string;
+    within_warning_tolerance: boolean;
+    within_critical_tolerance: boolean;
+    reason: string;
+    emergency_stop_triggered: boolean;
+  };
 };
 
 export type TimeframeReadiness = {
@@ -76,10 +84,51 @@ export type NotificationTestResponse = {
   message: string;
 };
 
+export type ReconciliationResponse = {
+  mode: "paper" | "live";
+  db_equity: string;
+  exchange_equity: string | null;
+  difference: string;
+  within_warning_tolerance: boolean;
+  within_critical_tolerance: boolean;
+  reason: string;
+  emergency_stop_triggered: boolean;
+};
+
 export type GridRecenterModeUpdateResponse = {
   active_strategy: string;
   mode: "conservative" | "aggressive";
   applied_to_live_strategy: boolean;
+};
+
+export type GridPreviewLevel = {
+  level: number;
+  price: string;
+  distance_bps: number;
+};
+
+export type GridPreview = {
+  symbol: string;
+  strategy: string;
+  last_price: string;
+  signal_side: string;
+  signal_reason: string;
+  confidence: number;
+  grid_center: string | null;
+  grid_upper: string | null;
+  grid_lower: string | null;
+  buy_trigger: string | null;
+  sell_trigger: string | null;
+  spacing_bps: number | null;
+  grid_step: string | null;
+  recentered: boolean;
+  recenter_mode: "conservative" | "aggressive" | string;
+  buy_levels: GridPreviewLevel[];
+  sell_levels: GridPreviewLevel[];
+  take_profit_trigger: string | null;
+  stop_loss_trigger: string | null;
+  position_quantity: string;
+  bootstrap_eligible: boolean;
 };
 
 export type Position = {
@@ -116,6 +165,10 @@ export type TradingConfig = {
   spot_position_mode: string;
   paper_starting_equity: number;
   advisor_interval_cycles: number;
+  min_cycle_interval_seconds: number;
+  reconciliation_interval_cycles: number;
+  reconciliation_warning_tolerance: number;
+  reconciliation_critical_tolerance: number;
   grid_lookback_1h: number;
   grid_atr_period_1h: number;
   grid_levels: number;
@@ -143,6 +196,7 @@ export type TradingConfig = {
   fee_bps: number;
   slippage_bps: number;
   approval_timeout_hours: number;
+  approval_auto_approve_enabled: boolean;
 };
 
 export type Order = {
@@ -191,6 +245,14 @@ export type PaperCycleResult = {
   fill_id: string | null;
   quantity: string;
   price: string | null;
+  reconciliation?: {
+    mode: "paper" | "live";
+    difference: string;
+    within_warning_tolerance: boolean;
+    within_critical_tolerance: boolean;
+    reason: string;
+    emergency_stop_triggered: boolean;
+  };
 };
 
 export type LiveOrderResponse = {
@@ -216,6 +278,11 @@ export type Approval = {
   decided_by: string | null;
   decided_at: string | null;
   created_at: string;
+};
+
+export type AutoApproveStatus = {
+  enabled: boolean;
+  decided_by: string;
 };
 
 export type AuditEvent = {
@@ -251,6 +318,23 @@ const API_BASE = rawApiBase
   .trim()
   .split(/\s+/)[0]
   .replace(/\/+$/, "");
+const API_BASE_CANDIDATES = (() => {
+  const candidates = [API_BASE];
+  try {
+    const parsed = new URL(API_BASE);
+    const isLocalHost = parsed.hostname === "127.0.0.1" || parsed.hostname === "localhost";
+    if (isLocalHost && parsed.port === "8001") {
+      parsed.port = "8000";
+      const fallback = parsed.toString().replace(/\/+$/, "");
+      if (!candidates.includes(fallback)) {
+        candidates.push(fallback);
+      }
+    }
+  } catch {
+    // Keep original base only if parsing fails.
+  }
+  return candidates;
+})();
 const TOKEN_KEY = "tb_access_token";
 
 export class ApiError extends Error {
@@ -283,27 +367,39 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     headers.set("Authorization", `Bearer ${token}`);
   }
 
-  let response: Response;
-  try {
-    response = await fetch(`${API_BASE}${path}`, {
-      ...init,
-      headers,
-    });
-  } catch (error) {
-    if (error instanceof Error) {
-      throw new Error(
-        `${error.message}. API base is "${API_BASE}". Check VITE_API_BASE_URL and that the API server is running.`,
-      );
+  let lastError: unknown = null;
+  for (let i = 0; i < API_BASE_CANDIDATES.length; i += 1) {
+    const base = API_BASE_CANDIDATES[i];
+    const isLastBase = i === API_BASE_CANDIDATES.length - 1;
+    try {
+      const response = await fetch(`${base}${path}`, {
+        ...init,
+        headers,
+      });
+
+      if (response.ok) {
+        return (await response.json()) as T;
+      }
+
+      if (!isLastBase && response.status === 404) {
+        continue;
+      }
+      const body = await response.text();
+      throw new ApiError(`${response.status} ${response.statusText}: ${body}`, response.status);
+    } catch (error) {
+      lastError = error;
+      if (!isLastBase) {
+        continue;
+      }
     }
-    throw error;
   }
 
-  if (!response.ok) {
-    const body = await response.text();
-    throw new ApiError(`${response.status} ${response.statusText}: ${body}`, response.status);
+  if (lastError instanceof Error) {
+    throw new Error(
+      `${lastError.message}. API bases tried: ${API_BASE_CANDIDATES.join(", ")}. Check VITE_API_BASE_URL and that the API server is running.`,
+    );
   }
-
-  return (await response.json()) as T;
+  throw lastError;
 }
 
 function buildQuery(params: Record<string, string | number | undefined>): string {
@@ -334,6 +430,13 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ title, body }),
     }),
+  runReconciliation: (warningTolerance = 1, criticalTolerance = 100) =>
+    fetchJson<ReconciliationResponse>(
+      `/api/system/reconciliation${buildQuery({
+        warning_tolerance: warningTolerance,
+        critical_tolerance: criticalTolerance,
+      })}`,
+    ),
   setSystemState: (action: "pause" | "resume" | "emergency_stop" | "manual_resume", reason: string) =>
     fetchJson<SystemState>("/api/system/state", {
       method: "POST",
@@ -352,6 +455,11 @@ export const api = {
     fetchJson<PaperCycleResult>("/api/trading/paper/cycle", {
       method: "POST",
     }),
+  closeAllPaperPositions: (reason = "manual_close_all_positions") =>
+    fetchJson<PaperCycleResult>("/api/trading/paper/close-all-positions", {
+      method: "POST",
+      body: JSON.stringify({ reason }),
+    }),
   getTradingConfig: () => fetchJson<TradingConfig>("/api/trading/config"),
   setGridRecenterMode: (mode: "conservative" | "aggressive", reason = "dashboard_grid_mode_update") =>
     fetchJson<GridRecenterModeUpdateResponse>("/api/trading/config/recenter-mode", {
@@ -359,6 +467,7 @@ export const api = {
       body: JSON.stringify({ mode, reason, changed_by: "web_dashboard" }),
     }),
   getPosition: () => fetchJson<Position>("/api/trading/position"),
+  getGridPreview: () => fetchJson<GridPreview | null>("/api/trading/grid/preview"),
   getMetrics: () => fetchJson<Metrics>("/api/trading/metrics"),
   getOrders: (limit = 10, status?: string) =>
     fetchJson<Order[]>(`/api/trading/orders${buildQuery({ limit, status })}`),
@@ -371,6 +480,12 @@ export const api = {
     fetchJson<MarketCandle[]>(`/api/market/candles${buildQuery({ symbol, timeframe, limit })}`),
   listApprovals: (status?: string, limit = 100) =>
     fetchJson<Approval[]>(`/api/ai/approvals${buildQuery({ status, limit })}`),
+  getAutoApproveStatus: () => fetchJson<AutoApproveStatus>("/api/ai/auto-approve"),
+  setAutoApproveStatus: (enabled: boolean, reason = "dashboard_toggle") =>
+    fetchJson<AutoApproveStatus>("/api/ai/auto-approve", {
+      method: "POST",
+      body: JSON.stringify({ enabled, reason, changed_by: "web_dashboard" }),
+    }),
   generateProposals: () =>
     fetchJson<Approval[]>("/api/ai/proposals/generate", {
       method: "POST",
@@ -417,6 +532,7 @@ export const api = {
     ui_confirmed: boolean;
     reauthenticated: boolean;
     safety_acknowledged: boolean;
+    idempotency_key?: string;
     reason: string;
   }) =>
     fetchJson<LiveOrderResponse>("/api/trading/live/order", {

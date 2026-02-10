@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -12,12 +13,22 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from packages.adapters.telegram_bot import get_telegram_notifier
 from packages.core.ai.advisor import AIProposal
 from packages.core.audit import log_event
+from packages.core.config import apply_runtime_config_patch, get_settings
 from packages.core.database.models import Approval, ApprovalStatus, Config
 from packages.core.state import get_state_manager
+from packages.core.trading_cycle import reset_trading_cycle_service
 
 
 class ApprovalGateError(ValueError):
     """Raised when approval operations fail validation."""
+
+
+@dataclass(slots=True)
+class PendingAutoApprovalSweep:
+    """Result of sweeping pending approvals while auto-approve is enabled."""
+
+    approved: list[Approval]
+    expired: list[Approval]
 
 
 class ApprovalGate:
@@ -65,6 +76,12 @@ class ApprovalGate:
             "AI approval created",
             f"#{approval.id} {approval.title}\nExpires at: {approval.expires_at.isoformat()}",
         )
+        if get_settings().approval.auto_approve_enabled:
+            approval = await self.approve(
+                session,
+                approval.id,
+                decided_by="ai_auto_approver",
+            )
         return approval
 
     async def list_approvals(
@@ -137,8 +154,92 @@ class ApprovalGate:
         )
         return approval
 
+    async def auto_approve_pending(
+        self,
+        session: AsyncSession,
+        *,
+        decided_by: str = "ai_auto_approver",
+        now: datetime | None = None,
+    ) -> PendingAutoApprovalSweep:
+        """Approve any pending proposals immediately (used when auto-approve mode is on)."""
+        check_time = now or _utc_now_naive()
+        result = await session.execute(
+            select(Approval)
+            .where(Approval.status == ApprovalStatus.PENDING.value)
+            .order_by(Approval.created_at.asc(), Approval.id.asc())
+        )
+        pending = list(result.scalars().all())
+        if not pending:
+            return PendingAutoApprovalSweep(approved=[], expired=[])
+
+        approved: list[Approval] = []
+        expired: list[Approval] = []
+
+        for approval in pending:
+            if _to_utc(approval.expires_at) <= _to_utc(check_time):
+                approval.status = ApprovalStatus.EXPIRED.value
+                approval.decided_by = decided_by
+                approval.decided_at = check_time
+                expired.append(approval)
+                await log_event(
+                    session,
+                    event_type="approval_expired",
+                    event_category="ai",
+                    summary=f"Approval #{approval.id} expired before auto-approve sweep",
+                    details={
+                        "approval_id": approval.id,
+                        "title": approval.title,
+                        "auto_approve_enabled": True,
+                    },
+                    inputs={"diff": approval.diff},
+                    actor=decided_by,
+                )
+                continue
+
+            await self._apply_config_diff(session, approval.diff)
+            approval.status = ApprovalStatus.APPROVED.value
+            approval.decided_by = decided_by
+            approval.decided_at = check_time
+            approved.append(approval)
+
+            await log_event(
+                session,
+                event_type="approval_approved",
+                event_category="ai",
+                summary=f"Approval #{approval.id} auto-approved",
+                details={
+                    "approval_id": approval.id,
+                    "title": approval.title,
+                    "auto_approved": True,
+                },
+                inputs={"diff": approval.diff},
+                actor=decided_by,
+            )
+
+        notifier = get_telegram_notifier()
+        if approved:
+            await notifier.send_info(
+                "AI auto-approved pending proposals",
+                f"Approved {len(approved)} pending approval(s).",
+            )
+        if expired:
+            await notifier.send_info(
+                "AI auto-approve sweep found expired proposals",
+                f"{len(expired)} pending approval(s) were already expired and were marked EXPIRED.",
+            )
+
+        return PendingAutoApprovalSweep(approved=approved, expired=expired)
+
     async def expire_pending(self, session: AsyncSession) -> list[Approval]:
         now = _utc_now_naive()
+        if get_settings().approval.auto_approve_enabled:
+            sweep = await self.auto_approve_pending(
+                session,
+                decided_by="ai_auto_approver",
+                now=now,
+            )
+            return sweep.expired
+
         result = await session.execute(
             select(Approval).where(
                 Approval.status == ApprovalStatus.PENDING.value,
@@ -203,6 +304,9 @@ class ApprovalGate:
         new_config = Config(version=current.version + 1, data=new_data, active=True)
         session.add(new_config)
         await session.flush()
+        session.info["active_config_version"] = new_config.version
+        apply_runtime_config_patch(new_data)
+        reset_trading_cycle_service()
         return new_config
 
     async def _get_or_create_active_config(self, session: AsyncSession) -> Config:

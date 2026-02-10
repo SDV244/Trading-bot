@@ -29,6 +29,8 @@ async def test_place_market_order_success(monkeypatch: pytest.MonkeyPatch) -> No
     adapter = BinanceLiveAdapter()
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/v3/time"):
+            return httpx.Response(status_code=200, json={"serverTime": 1_700_000_000_000})
         assert request.method == "POST"
         assert request.url.path.endswith("/api/v3/order")
         return httpx.Response(
@@ -58,8 +60,11 @@ async def test_place_market_order_retries_with_same_client_order_id(monkeypatch:
     call_count = 0
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/api/v3/time"):
+            return httpx.Response(status_code=200, json={"serverTime": 1_700_000_000_000})
         nonlocal call_count
         call_count += 1
+        assert request.url.path.endswith("/api/v3/order")
         query = parse_qs(request.url.query.decode() if isinstance(request.url.query, bytes) else request.url.query)
         cid = query["newClientOrderId"][0]
         seen_client_ids.append(cid)

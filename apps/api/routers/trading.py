@@ -4,12 +4,13 @@ Trading Endpoints
 Endpoints for trading operations, positions, and orders.
 """
 
+import hashlib
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from apps.api.security.auth import AuthUser, require_min_role
 from packages.core.config import AuthRole
@@ -89,6 +90,10 @@ class ConfigResponse(BaseModel):
     spot_position_mode: str
     paper_starting_equity: float
     advisor_interval_cycles: int
+    min_cycle_interval_seconds: int
+    reconciliation_interval_cycles: int
+    reconciliation_warning_tolerance: float
+    reconciliation_critical_tolerance: float
     grid_lookback_1h: int
     grid_atr_period_1h: int
     grid_levels: int
@@ -116,6 +121,7 @@ class ConfigResponse(BaseModel):
     fee_bps: int
     slippage_bps: int
     approval_timeout_hours: int
+    approval_auto_approve_enabled: bool
 
 
 class PaperCycleResponse(BaseModel):
@@ -133,6 +139,31 @@ class PaperCycleResponse(BaseModel):
     price: str | None
 
 
+class CloseAllPaperPositionsRequest(BaseModel):
+    """Request payload to force-close all open paper positions."""
+
+    reason: str = Field(default="manual_close_all_positions", min_length=3, max_length=200)
+
+
+class PaperResetRequest(BaseModel):
+    """Request payload to reset paper-account state/history."""
+
+    reason: str = Field(default="manual_paper_reset", min_length=3, max_length=200)
+
+
+class PaperResetResponse(BaseModel):
+    """Reset summary response."""
+
+    reset: bool
+    reason: str
+    deleted_orders: int
+    deleted_fills: int
+    deleted_positions: int
+    deleted_equity_snapshots: int
+    deleted_metrics_snapshots: int
+    paper_starting_equity: float
+
+
 class LiveOrderRequest(BaseModel):
     """Live market order request (explicitly gated)."""
 
@@ -142,6 +173,7 @@ class LiveOrderRequest(BaseModel):
     reauthenticated: bool
     safety_acknowledged: bool
     client_order_id: str | None = Field(default=None, max_length=36)
+    idempotency_key: str | None = Field(default=None, min_length=8, max_length=128)
     reason: str = Field(default="", description="Operator reason for live order")
 
 
@@ -169,6 +201,40 @@ class GridRecenterModeUpdateResponse(BaseModel):
     active_strategy: str
     mode: str
     applied_to_live_strategy: bool
+
+
+class GridLevelPreviewResponse(BaseModel):
+    """One projected smart-grid level."""
+
+    level: int
+    price: str
+    distance_bps: float
+
+
+class GridPreviewResponse(BaseModel):
+    """Smart-grid level/trigger preview for operator UX."""
+
+    symbol: str
+    strategy: str
+    last_price: str
+    signal_side: str
+    signal_reason: str
+    confidence: float
+    grid_center: str | None
+    grid_upper: str | None
+    grid_lower: str | None
+    buy_trigger: str | None
+    sell_trigger: str | None
+    spacing_bps: float | None
+    grid_step: str | None
+    recentered: bool
+    recenter_mode: str
+    buy_levels: list[GridLevelPreviewResponse]
+    sell_levels: list[GridLevelPreviewResponse]
+    take_profit_trigger: str | None
+    stop_loss_trigger: str | None
+    position_quantity: str
+    bootstrap_eligible: bool
 
 
 async def _ensure_database() -> None:
@@ -201,6 +267,10 @@ async def get_trading_config(
         spot_position_mode=settings.trading.spot_position_mode,
         paper_starting_equity=settings.trading.paper_starting_equity,
         advisor_interval_cycles=settings.trading.advisor_interval_cycles,
+        min_cycle_interval_seconds=settings.trading.min_cycle_interval_seconds,
+        reconciliation_interval_cycles=settings.trading.reconciliation_interval_cycles,
+        reconciliation_warning_tolerance=settings.trading.reconciliation_warning_tolerance,
+        reconciliation_critical_tolerance=settings.trading.reconciliation_critical_tolerance,
         grid_lookback_1h=settings.trading.grid_lookback_1h,
         grid_atr_period_1h=settings.trading.grid_atr_period_1h,
         grid_levels=settings.trading.grid_levels,
@@ -228,6 +298,7 @@ async def get_trading_config(
         fee_bps=settings.risk.fee_bps,
         slippage_bps=settings.risk.slippage_bps,
         approval_timeout_hours=settings.approval.timeout_hours,
+        approval_auto_approve_enabled=settings.approval.auto_approve_enabled,
     )
 
 
@@ -313,6 +384,62 @@ async def get_current_position(
         realized_pnl=str(position.realized_pnl),
         total_fees=str(position.total_fees),
         is_paper=position.is_paper,
+    )
+
+
+@router.get("/grid/preview", response_model=GridPreviewResponse | None)
+async def get_grid_preview(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> GridPreviewResponse | None:
+    """Get current smart-grid projected levels/triggers (if strategy supports it)."""
+    from packages.core.database.session import get_session
+    from packages.core.trading_cycle import get_trading_cycle_service
+
+    await _ensure_database()
+    service = get_trading_cycle_service()
+
+    async with get_session() as session:
+        preview = await service.get_grid_preview(session)
+
+    if preview is None:
+        return None
+
+    return GridPreviewResponse(
+        symbol=preview.symbol,
+        strategy=preview.strategy,
+        last_price=str(preview.last_price),
+        signal_side=preview.signal_side,
+        signal_reason=preview.signal_reason,
+        confidence=preview.confidence,
+        grid_center=str(preview.grid_center) if preview.grid_center is not None else None,
+        grid_upper=str(preview.grid_upper) if preview.grid_upper is not None else None,
+        grid_lower=str(preview.grid_lower) if preview.grid_lower is not None else None,
+        buy_trigger=str(preview.buy_trigger) if preview.buy_trigger is not None else None,
+        sell_trigger=str(preview.sell_trigger) if preview.sell_trigger is not None else None,
+        spacing_bps=preview.spacing_bps,
+        grid_step=str(preview.grid_step) if preview.grid_step is not None else None,
+        recentered=preview.recentered,
+        recenter_mode=preview.recenter_mode,
+        buy_levels=[
+            GridLevelPreviewResponse(
+                level=level.level,
+                price=str(level.price),
+                distance_bps=float(level.distance_bps),
+            )
+            for level in preview.buy_levels
+        ],
+        sell_levels=[
+            GridLevelPreviewResponse(
+                level=level.level,
+                price=str(level.price),
+                distance_bps=float(level.distance_bps),
+            )
+            for level in preview.sell_levels
+        ],
+        take_profit_trigger=str(preview.take_profit_trigger) if preview.take_profit_trigger is not None else None,
+        stop_loss_trigger=str(preview.stop_loss_trigger) if preview.stop_loss_trigger is not None else None,
+        position_quantity=str(preview.position_quantity),
+        bootstrap_eligible=preview.bootstrap_eligible,
     )
 
 
@@ -474,12 +601,13 @@ async def run_paper_cycle(
 ) -> PaperCycleResponse:
     """Run one paper trading cycle."""
     from packages.core.database.session import get_session
+    from packages.core.execution_lock import symbol_execution_lock
     from packages.core.trading_cycle import get_trading_cycle_service
 
     try:
         await _ensure_database()
         service = get_trading_cycle_service()
-        async with get_session() as session:
+        async with symbol_execution_lock(service.symbol), get_session() as session:
             result = await service.run_once(session)
             return PaperCycleResponse(
                 symbol=result.symbol,
@@ -497,18 +625,143 @@ async def run_paper_cycle(
         raise HTTPException(status_code=500, detail=f"Paper cycle failed: {e}")
 
 
+@router.post("/paper/close-all-positions", response_model=PaperCycleResponse)
+async def close_all_paper_positions(
+    request: CloseAllPaperPositionsRequest,
+    user: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> PaperCycleResponse:
+    """Force-close any open paper position inventory at current market price."""
+    from packages.core.audit import log_event
+    from packages.core.database.session import get_session
+    from packages.core.execution_lock import symbol_execution_lock
+    from packages.core.trading_cycle import get_trading_cycle_service
+
+    await _ensure_database()
+    service = get_trading_cycle_service()
+    try:
+        async with symbol_execution_lock(service.symbol), get_session() as session:
+            await log_event(
+                session,
+                event_type="paper_close_position_requested",
+                event_category="trade",
+                summary=f"Manual paper close-all requested: {request.reason}",
+                details={"symbol": service.symbol, "reason": request.reason},
+                actor=user.username,
+            )
+            result = await service.close_open_paper_position(
+                session,
+                reason=request.reason,
+                actor=user.username,
+            )
+            return PaperCycleResponse(
+                symbol=result.symbol,
+                signal_side=result.signal_side,
+                signal_reason=result.signal_reason,
+                risk_action=result.risk_action,
+                risk_reason=result.risk_reason,
+                executed=result.executed,
+                order_id=result.order_id,
+                fill_id=result.fill_id,
+                quantity=result.quantity,
+                price=result.price,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Close-all paper positions failed: {e}")
+
+
+@router.post("/paper/reset", response_model=PaperResetResponse)
+async def reset_paper_account(
+    request: PaperResetRequest,
+    user: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> PaperResetResponse:
+    """Reset paper-account trade history, position state, and performance snapshots."""
+    from packages.core.audit import log_event
+    from packages.core.config import get_settings
+    from packages.core.database.models import EquitySnapshot, Fill, MetricsSnapshot, Order, Position
+    from packages.core.database.session import get_session
+    from packages.core.state import get_state_manager
+    from packages.core.trading_cycle import reset_trading_cycle_service
+
+    await _ensure_database()
+    state = get_state_manager()
+    if state.current.state.value != "paused":
+        raise HTTPException(
+            status_code=409,
+            detail="Paper reset requires system state PAUSED. Pause first, then reset.",
+        )
+
+    settings = get_settings()
+    deleted_orders = 0
+    deleted_fills = 0
+    deleted_positions = 0
+    deleted_equity_snapshots = 0
+    deleted_metrics_snapshots = 0
+
+    try:
+        async with get_session() as session:
+            fills_result = await session.execute(delete(Fill).where(Fill.is_paper.is_(True)))
+            deleted_fills = int(fills_result.rowcount or 0)
+
+            orders_result = await session.execute(delete(Order).where(Order.is_paper.is_(True)))
+            deleted_orders = int(orders_result.rowcount or 0)
+
+            positions_result = await session.execute(delete(Position).where(Position.is_paper.is_(True)))
+            deleted_positions = int(positions_result.rowcount or 0)
+
+            equity_result = await session.execute(
+                delete(EquitySnapshot).where(EquitySnapshot.is_paper.is_(True))
+            )
+            deleted_equity_snapshots = int(equity_result.rowcount or 0)
+
+            metrics_result = await session.execute(
+                delete(MetricsSnapshot).where(MetricsSnapshot.is_paper.is_(True))
+            )
+            deleted_metrics_snapshots = int(metrics_result.rowcount or 0)
+
+            await log_event(
+                session,
+                event_type="paper_account_reset",
+                event_category="system",
+                summary="Paper account reset completed",
+                details={
+                    "reason": request.reason,
+                    "deleted_orders": deleted_orders,
+                    "deleted_fills": deleted_fills,
+                    "deleted_positions": deleted_positions,
+                    "deleted_equity_snapshots": deleted_equity_snapshots,
+                    "deleted_metrics_snapshots": deleted_metrics_snapshots,
+                    "paper_starting_equity": settings.trading.paper_starting_equity,
+                },
+                actor=user.username,
+            )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Paper reset failed: {e}")
+
+    reset_trading_cycle_service()
+    return PaperResetResponse(
+        reset=True,
+        reason=request.reason,
+        deleted_orders=deleted_orders,
+        deleted_fills=deleted_fills,
+        deleted_positions=deleted_positions,
+        deleted_equity_snapshots=deleted_equity_snapshots,
+        deleted_metrics_snapshots=deleted_metrics_snapshots,
+        paper_starting_equity=settings.trading.paper_starting_equity,
+    )
+
+
 @router.post("/live/order", response_model=LiveOrderResponse)
 async def submit_live_order(
     request: LiveOrderRequest,
     user: AuthUser = Depends(require_min_role(AuthRole.ADMIN)),
 ) -> LiveOrderResponse:
     """Submit one live market order with mandatory safety checklist."""
-    from decimal import Decimal
+    from decimal import Decimal, InvalidOperation
     from uuid import uuid4
 
-    from packages.core.audit import log_event
-    from packages.core.config import get_settings
-    from packages.core.database.models import Fill, Order
+    from packages.core.audit import log_event, resolve_active_config_version
+    from packages.core.config import Settings, get_settings
+    from packages.core.database.models import Fill, Order, OrderAttempt, OrderAttemptStatus
     from packages.core.database.session import get_session
     from packages.core.execution import (
         LiveEngine,
@@ -516,6 +769,7 @@ async def submit_live_order(
         LiveSafetyChecklist,
         OrderRequest,
     )
+    from packages.core.observability import increment_live_order
     from packages.core.state import get_state_manager
 
     await _ensure_database()
@@ -527,74 +781,172 @@ async def submit_live_order(
 
     try:
         quantity = Decimal(request.quantity)
-    except Exception:
+    except (InvalidOperation, ValueError):
         raise HTTPException(status_code=422, detail="Invalid quantity")
     side = cast(Literal["BUY", "SELL"], request.side)
+    symbol = settings.trading.pair
 
-    engine = LiveEngine()
-    try:
-        result = await engine.execute_market_order(
-            OrderRequest(symbol=settings.trading.pair, side=side, quantity=quantity, order_type="MARKET"),
-            checklist=LiveSafetyChecklist(
-                ui_confirmed=request.ui_confirmed,
-                reauthenticated=request.reauthenticated,
-                safety_acknowledged=request.safety_acknowledged,
-            ),
-            client_order_id=request.client_order_id,
+    def _derive_idempotency_key(settings_obj: Settings) -> str:
+        if request.idempotency_key:
+            return request.idempotency_key.strip().lower()
+        # Five-minute bucket prevents accidental duplicate clicks/retries
+        # while still allowing new manual orders later with same payload.
+        bucket = int(datetime.now(UTC).timestamp() // 300)
+        material = "|".join(
+            [
+                symbol,
+                side,
+                format(quantity.normalize(), "f"),
+                request.client_order_id or "",
+                request.reason or "",
+                user.username,
+                str(bucket),
+                str(settings_obj.live.recv_window_ms),
+            ]
         )
-    except LiveEngineError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    idempotency_key = _derive_idempotency_key(settings)
+    explicit_client_order_id = request.client_order_id or f"live_{uuid4().hex[:24]}"
 
     async with get_session() as session:
-        order = Order(
-            client_order_id=result.client_order_id or request.client_order_id or f"live_{uuid4().hex[:24]}",
-            exchange_order_id=result.order_id,
-            symbol=settings.trading.pair,
-            side=side,
-            order_type="MARKET",
-            quantity=result.quantity or quantity,
-            price=result.price,
-            status="FILLED" if result.accepted else "REJECTED",
-            is_paper=False,
-            strategy_name="manual_live",
-            signal_reason=request.reason or "manual_live_order",
-            config_version=1,
+        config_version = await resolve_active_config_version(session)
+        attempt_result = await session.execute(
+            select(OrderAttempt).where(OrderAttempt.idempotency_key == idempotency_key)
         )
-        session.add(order)
-        await session.flush()
+        attempt = attempt_result.scalar_one_or_none()
 
-        if result.accepted and result.quantity is not None and result.price is not None:
-            session.add(
-                Fill(
-                    order_id=order.id,
-                    fill_id=f"live_{result.order_id or order.id}",
-                    quantity=result.quantity,
-                    price=result.price,
-                    fee=Decimal("0"),
-                    fee_asset="USDT",
-                    is_paper=False,
-                    slippage_bps=None,
-                )
+        if attempt is None:
+            attempt = OrderAttempt(
+                idempotency_key=idempotency_key,
+                symbol=symbol,
+                side=side,
+                order_type="MARKET",
+                quantity=quantity,
+                status=OrderAttemptStatus.PENDING.value,
+                client_order_id=explicit_client_order_id,
+                exchange_order_id=None,
+                error_message=None,
             )
+            session.add(attempt)
+            await session.commit()
+        else:
+            explicit_client_order_id = attempt.client_order_id
+
+        existing_order_result = await session.execute(
+            select(Order).where(
+                Order.client_order_id == explicit_client_order_id,
+                Order.is_paper.is_(False),
+            )
+        )
+        existing_order = existing_order_result.scalar_one_or_none()
+        if existing_order is None and attempt.status == OrderAttemptStatus.CONFIRMED.value:
+            return LiveOrderResponse(
+                accepted=True,
+                reason="idempotent_replay_confirmed_exchange_only",
+                order_id=attempt.exchange_order_id,
+                quantity=str(attempt.quantity),
+                price=None,
+            )
+        if existing_order is not None and attempt.status == OrderAttemptStatus.CONFIRMED.value:
+            existing_fill_result = await session.execute(
+                select(Fill).where(Fill.order_id == existing_order.id).limit(1)
+            )
+            existing_fill = existing_fill_result.scalar_one_or_none()
+            return LiveOrderResponse(
+                accepted=existing_order.status == "FILLED",
+                reason="idempotent_replay_confirmed",
+                order_id=existing_order.exchange_order_id,
+                quantity=str(existing_order.quantity),
+                price=str(existing_fill.price) if existing_fill is not None else None,
+            )
+
+        engine = LiveEngine()
+        try:
+            result = await engine.execute_market_order(
+                OrderRequest(symbol=symbol, side=side, quantity=quantity, order_type="MARKET"),
+                checklist=LiveSafetyChecklist(
+                    ui_confirmed=request.ui_confirmed,
+                    reauthenticated=request.reauthenticated,
+                    safety_acknowledged=request.safety_acknowledged,
+                ),
+                client_order_id=explicit_client_order_id,
+            )
+        except LiveEngineError as e:
+            attempt.status = OrderAttemptStatus.FAILED.value
+            attempt.error_message = str(e)
+            attempt.last_checked_at = datetime.now(UTC)
+            await session.commit()
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            attempt.status = OrderAttemptStatus.FAILED.value
+            attempt.error_message = str(e)
+            attempt.last_checked_at = datetime.now(UTC)
+            await session.commit()
+            raise HTTPException(status_code=503, detail=f"Live order failed: {e}")
+
+        persisted_order = existing_order
+        if persisted_order is None:
+            persisted_order = Order(
+                client_order_id=result.client_order_id or explicit_client_order_id,
+                exchange_order_id=result.order_id,
+                symbol=symbol,
+                side=side,
+                order_type="MARKET",
+                quantity=result.quantity or quantity,
+                price=result.price,
+                status="FILLED" if result.accepted else "REJECTED",
+                is_paper=False,
+                strategy_name="manual_live",
+                signal_reason=request.reason or "manual_live_order",
+                config_version=config_version,
+            )
+            session.add(persisted_order)
+            await session.flush()
+
+            if result.accepted and result.quantity is not None and result.price is not None:
+                session.add(
+                    Fill(
+                        order_id=persisted_order.id,
+                        fill_id=f"live_{persisted_order.id}_{result.order_id or 'na'}",
+                        quantity=result.quantity,
+                        price=result.price,
+                        fee=Decimal("0"),
+                        fee_asset="USDT",
+                        is_paper=False,
+                        slippage_bps=None,
+                    )
+                )
+
+        attempt.status = (
+            OrderAttemptStatus.CONFIRMED.value if result.accepted else OrderAttemptStatus.FAILED.value
+        )
+        attempt.exchange_order_id = result.order_id
+        attempt.error_message = None if result.accepted else result.reason
+        attempt.last_checked_at = datetime.now(UTC)
 
         await log_event(
             session,
             event_type="live_order_submitted",
             event_category="trade",
-            summary=f"Live order {side} {request.quantity} {settings.trading.pair}",
+            summary=f"Live order {side} {request.quantity} {symbol}",
             details={
                 "accepted": result.accepted,
                 "reason": result.reason,
                 "exchange_order_id": result.order_id,
+                "idempotency_key": idempotency_key,
+                "client_order_id": explicit_client_order_id,
             },
             inputs=request.model_dump(),
             actor=user.username,
+            config_version=config_version,
         )
+        increment_live_order(accepted=result.accepted, side=side)
 
-    return LiveOrderResponse(
-        accepted=result.accepted,
-        reason=result.reason,
-        order_id=result.order_id,
-        quantity=str(result.quantity) if result.quantity is not None else None,
-        price=str(result.price) if result.price is not None else None,
-    )
+        return LiveOrderResponse(
+            accepted=result.accepted,
+            reason=result.reason,
+            order_id=result.order_id,
+            quantity=str(result.quantity) if result.quantity is not None else None,
+            price=str(result.price) if result.price is not None else None,
+        )

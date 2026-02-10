@@ -9,9 +9,11 @@ from sqlalchemy import select
 
 from apps.api.security.auth import AuthUser, require_min_role
 from packages.core.ai import ApprovalGateError, get_ai_advisor, get_approval_gate
-from packages.core.config import AuthRole
+from packages.core.audit import log_event
+from packages.core.config import AuthRole, apply_runtime_config_patch, get_settings
 from packages.core.database.models import Approval, EquitySnapshot, EventLog
 from packages.core.database.session import get_session, init_database
+from packages.core.observability import increment_approval
 
 if TYPE_CHECKING:
     from packages.core.ai.drl_optimizer import DRLOptimizer
@@ -83,6 +85,45 @@ class OptimizerProposalResponse(BaseModel):
     confidence: float
 
 
+class AutoApproveStatusResponse(BaseModel):
+    """AI auto-approval runtime status."""
+
+    enabled: bool
+    decided_by: str
+
+
+class AutoApproveUpdateRequest(BaseModel):
+    """Request payload for AI auto-approval toggle."""
+
+    enabled: bool
+    reason: str = Field(default="dashboard_toggle")
+    changed_by: str = Field(default="web_dashboard")
+
+
+class LLMStatusResponse(BaseModel):
+    """LLM advisor runtime status."""
+
+    enabled: bool
+    provider: str
+    model: str
+    configured: bool
+    base_url: str | None
+    prefer_llm: bool
+    fallback_to_rules: bool
+    last_error: str | None
+
+
+class LLMTestResponse(BaseModel):
+    """LLM connectivity test result."""
+
+    ok: bool
+    provider: str
+    model: str
+    latency_ms: int | None
+    message: str
+    raw_proposals_count: int | None = None
+
+
 def _to_approval_response(approval: Approval) -> ApprovalResponse:
     return ApprovalResponse(
         id=approval.id,
@@ -115,8 +156,84 @@ async def generate_proposals(
         proposals = await advisor.generate_proposals(session)
         created: list[Approval] = []
         for proposal in proposals:
-            created.append(await gate.create_approval(session, proposal))
+            approval = await gate.create_approval(session, proposal)
+            created.append(approval)
+            if approval.status == "APPROVED":
+                increment_approval("auto_approved")
+            else:
+                increment_approval("created")
         return [_to_approval_response(a) for a in created]
+
+
+@router.get("/llm/status", response_model=LLMStatusResponse)
+async def get_llm_status(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> LLMStatusResponse:
+    """Get configured LLM advisor status."""
+    status = get_ai_advisor().llm_status()
+    return LLMStatusResponse(**status)
+
+
+@router.post("/llm/test", response_model=LLMTestResponse)
+async def test_llm_connection(
+    _: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> LLMTestResponse:
+    """Run a lightweight LLM connectivity test using current provider settings."""
+    result = await get_ai_advisor().test_llm_connection()
+    return LLMTestResponse(**result)
+
+
+@router.get("/auto-approve", response_model=AutoApproveStatusResponse)
+async def get_auto_approve_status(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> AutoApproveStatusResponse:
+    """Get current AI auto-approval mode."""
+    settings = get_settings()
+    return AutoApproveStatusResponse(
+        enabled=settings.approval.auto_approve_enabled,
+        decided_by="ai_auto_approver",
+    )
+
+
+@router.post("/auto-approve", response_model=AutoApproveStatusResponse)
+async def set_auto_approve_status(
+    request: AutoApproveUpdateRequest,
+    user: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> AutoApproveStatusResponse:
+    """Enable/disable automatic approval of AI proposals."""
+    await init_database()
+    gate = get_approval_gate()
+    applied = apply_runtime_config_patch({"approval": {"auto_approve_enabled": request.enabled}})
+    auto_approved_pending = 0
+    auto_expired_pending = 0
+    async with get_session() as session:
+        if request.enabled:
+            sweep = await gate.auto_approve_pending(session, decided_by="ai_auto_approver")
+            auto_approved_pending = len(sweep.approved)
+            auto_expired_pending = len(sweep.expired)
+            for _ in sweep.approved:
+                increment_approval("auto_approved")
+            for _ in sweep.expired:
+                increment_approval("expired")
+        await log_event(
+            session,
+            event_type="ai_auto_approve_toggled",
+            event_category="config",
+            summary=f"AI auto-approve set to {request.enabled}",
+            details={
+                "enabled": request.enabled,
+                "applied_keys": applied.get("approval", []),
+                "reason": request.reason,
+                "auto_approved_pending_count": auto_approved_pending,
+                "auto_expired_pending_count": auto_expired_pending,
+            },
+            actor=request.changed_by or user.username,
+        )
+    settings = get_settings()
+    return AutoApproveStatusResponse(
+        enabled=settings.approval.auto_approve_enabled,
+        decided_by="ai_auto_approver",
+    )
 
 
 @router.get("/approvals", response_model=list[ApprovalResponse])
@@ -147,6 +264,7 @@ async def approve_proposal(
             approval = await gate.approve(session, approval_id, decided_by=request.decided_by)
         except ApprovalGateError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        increment_approval("approved")
         return _to_approval_response(approval)
 
 
@@ -169,6 +287,7 @@ async def reject_proposal(
             )
         except ApprovalGateError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        increment_approval("rejected")
         return _to_approval_response(approval)
 
 
@@ -181,6 +300,8 @@ async def expire_check(
     gate = get_approval_gate()
     async with get_session() as session:
         expired = await gate.expire_pending(session)
+        if expired:
+            increment_approval("expired")
         return {"expired_count": len(expired)}
 
 

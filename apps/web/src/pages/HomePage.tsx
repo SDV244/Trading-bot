@@ -22,32 +22,57 @@ function toneClass(tone: ActivityTone): string {
 export function HomePage() {
   const { data, loading } = useDashboard();
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [livePricePoints, setLivePricePoints] = useState<Array<{ timestamp: string; price: number }>>([]);
 
   useEffect(() => {
     const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    const priceRaw = data.marketPrice?.price;
+    const timestamp = data.marketPrice?.timestamp;
+    const price = Number(priceRaw);
+    if (!timestamp || !Number.isFinite(price)) {
+      return;
+    }
+    setLivePricePoints((prev) => {
+      const last = prev[prev.length - 1];
+      if (last?.timestamp === timestamp) {
+        return prev;
+      }
+      const next = [...prev, { timestamp, price }];
+      return next.slice(-240);
+    });
+  }, [data.marketPrice?.price, data.marketPrice?.timestamp]);
+
   const equityValues = data.equity.map((point) => Number(point.equity));
   const latestEquity = data.equity.length > 0 ? data.equity[data.equity.length - 1]?.equity : null;
   const marketCandlesChrono = useMemo(() => [...data.marketCandles].reverse(), [data.marketCandles]);
-  const marketValues = marketCandlesChrono.map((candle) => Number(candle.close));
-  const latestMarketClose = marketCandlesChrono.length > 0
-    ? marketCandlesChrono[marketCandlesChrono.length - 1]?.close
-    : null;
+  const hasLiveSeries = livePricePoints.length >= 2;
+  const marketValues = hasLiveSeries
+    ? livePricePoints.map((point) => point.price)
+    : marketCandlesChrono.map((candle) => Number(candle.close));
+  const latestMarketClose = hasLiveSeries
+    ? String(livePricePoints[livePricePoints.length - 1]?.price ?? "")
+    : marketCandlesChrono.length > 0
+      ? marketCandlesChrono[marketCandlesChrono.length - 1]?.close
+      : null;
   const latestMarketPrice = data.marketPrice?.price ?? latestMarketClose ?? null;
   const marketChangePct = useMemo(() => {
-    if (marketCandlesChrono.length < 2) {
+    if (marketValues.length < 2) {
       return null;
     }
-    const first = Number(marketCandlesChrono[0]?.close);
-    const last = Number(marketCandlesChrono[marketCandlesChrono.length - 1]?.close);
+    const first = Number(marketValues[0]);
+    const last = Number(marketValues[marketValues.length - 1]);
     if (!Number.isFinite(first) || !Number.isFinite(last) || first === 0) {
       return null;
     }
     return ((last - first) / first) * 100;
-  }, [marketCandlesChrono]);
+  }, [marketValues]);
   const lastResult = data.scheduler?.last_result ?? data.lastCycle ?? null;
+  const reconciliation = lastResult?.reconciliation ?? null;
+  const gridPreview = data.gridPreview;
   const tradeSymbol = lastResult?.symbol ?? data.config?.trading_pair ?? "BTCUSDT";
   const baseAsset = tradeSymbol.endsWith("USDT") ? tradeSymbol.replace("USDT", "") : tradeSymbol;
 
@@ -112,12 +137,103 @@ export function HomePage() {
       };
     }
 
+    if (reconciliation && !reconciliation.within_critical_tolerance) {
+      return {
+        tone: "error" as const,
+        label: "RECONCILIATION_ALERT",
+        detail: `Critical mismatch detected: diff ${formatNumber(reconciliation.difference, 4)}.`,
+      };
+    }
+
     return {
       tone: "wait" as const,
       label: "WAITING_CONDITION",
       detail: explainRiskReason(lastResult.risk_reason),
     };
-  }, [baseAsset, data.scheduler, data.systemReadiness, lastResult]);
+  }, [baseAsset, data.scheduler, data.systemReadiness, lastResult, reconciliation]);
+
+  const expectedAction = useMemo(() => {
+    const activeStrategy = data.systemReadiness?.active_strategy ?? data.config?.active_strategy ?? "";
+    if (!data.systemReadiness?.can_trade) {
+      return {
+        label: "Resume Required",
+        detail: data.systemReadiness?.reasons.join(" | ") || "System is not in RUNNING state.",
+      };
+    }
+    if (!data.scheduler?.running) {
+      return {
+        label: "Scheduler Stopped",
+        detail: "Start scheduler to continue automatic analysis cycles.",
+      };
+    }
+    if (!data.systemReadiness?.data_ready && data.systemReadiness?.require_data_ready) {
+      return {
+        label: "Warmup Pending",
+        detail: data.systemReadiness.reasons.join(" | "),
+      };
+    }
+    if (activeStrategy !== "smart_grid_ai") {
+      if (lastResult && !lastResult.executed) {
+        return {
+          label: "Risk Hold",
+          detail: explainRiskReason(lastResult.risk_reason),
+        };
+      }
+      return {
+        label: "Monitoring",
+        detail: `${activeStrategy || "Active strategy"} is running without grid-projection telemetry.`,
+      };
+    }
+    if (!gridPreview) {
+      if (lastResult && !lastResult.executed) {
+        return {
+          label: "Analyzing",
+          detail: explainRiskReason(lastResult.risk_reason),
+        };
+      }
+      return {
+        label: "Analyzing",
+        detail: "Waiting for smart-grid projection data from API cycles.",
+      };
+    }
+    if (gridPreview.bootstrap_eligible) {
+      return {
+        label: "Bootstrap BUY",
+        detail: "Next cycle can seed initial paper inventory so SELL levels can execute.",
+      };
+    }
+
+    const last = Number(gridPreview.last_price);
+    const buyTrigger = Number(gridPreview.buy_trigger ?? NaN);
+    const sellTrigger = Number(gridPreview.sell_trigger ?? NaN);
+
+    if (Number.isFinite(last) && Number.isFinite(buyTrigger) && Number.isFinite(sellTrigger) && last > 0) {
+      const buyDistanceBps = ((buyTrigger - last) / last) * 10000;
+      const sellDistanceBps = ((sellTrigger - last) / last) * 10000;
+      const nearestIsBuy = Math.abs(buyDistanceBps) <= Math.abs(sellDistanceBps);
+      if (nearestIsBuy) {
+        return {
+          label: "Watch BUY Trigger",
+          detail: `Waiting for price to reach ${formatNumber(buyTrigger, 2)} (${formatNumber(buyDistanceBps, 1)} bps).`,
+        };
+      }
+      return {
+        label: "Watch SELL Trigger",
+        detail: `Waiting for price to reach ${formatNumber(sellTrigger, 2)} (${formatNumber(sellDistanceBps, 1)} bps).`,
+      };
+    }
+
+    if (lastResult && !lastResult.executed) {
+      return {
+        label: "Risk Hold",
+        detail: explainRiskReason(lastResult.risk_reason),
+      };
+    }
+    return {
+      label: "Monitoring",
+      detail: "Analyzing market and waiting for next valid trigger.",
+    };
+  }, [data.config?.active_strategy, data.scheduler, data.systemReadiness, gridPreview, lastResult]);
 
   return (
     <section className="grid gap-4">
@@ -182,8 +298,17 @@ export function HomePage() {
           </p>
           <p>Signal: {lastResult?.signal_side ?? "-"}</p>
           <p>Risk: {lastResult?.risk_action ?? "-"} ({lastResult?.risk_reason ?? "-"})</p>
+          <p>Reconciliation: {reconciliation ? reconciliation.reason : "-"}</p>
+          <p>Reconciliation Diff: {reconciliation ? formatNumber(reconciliation.difference, 4) : "-"}</p>
           <p>Executed: {String(lastResult?.executed ?? false)}</p>
           <p>Decision at: {formatDateTime(data.scheduler?.last_result?.executed_at ?? data.scheduler?.last_run_at)}</p>
+        </div>
+        <div className="mt-4 rounded-lg border border-white/20 bg-black/10 p-3 text-xs">
+          <p className="text-[11px] uppercase tracking-[0.2em] text-slate-300">Expected Next Action</p>
+          <p className="mt-2 inline-flex items-center gap-2 rounded-full border border-sky-300/40 bg-sky-500/10 px-3 py-1 text-[11px] uppercase tracking-[0.2em] text-sky-100">
+            {expectedAction.label}
+          </p>
+          <p className="mt-2 text-slate-200">{expectedAction.detail}</p>
         </div>
       </article>
 
@@ -197,12 +322,16 @@ export function HomePage() {
         </article>
         <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">
           <div className="mb-3 flex items-center justify-between">
-            <h2 className="font-heading text-lg font-bold text-white">{tradeSymbol} Live Curve (1h)</h2>
-            <p className="text-[11px] uppercase tracking-[0.2em] text-slate-300">{marketCandlesChrono.length} candles</p>
+            <h2 className="font-heading text-lg font-bold text-white">
+              {tradeSymbol} Live Curve ({hasLiveSeries ? "tick" : "1h"})
+            </h2>
+            <p className="text-[11px] uppercase tracking-[0.2em] text-slate-300">
+              {hasLiveSeries ? `${livePricePoints.length} ticks` : `${marketCandlesChrono.length} candles`}
+            </p>
           </div>
           <Sparkline points={marketValues} emptyLabel="No market candles yet. Fetch data first." />
           <p className="mt-3 text-xs text-slate-300">
-            Last ticker update: {formatDateTime(data.marketPrice?.timestamp ?? null)}
+            Last ticker update: {formatDateTime(data.marketPrice?.timestamp ?? null)} (refreshes every ~5s)
           </p>
         </article>
         <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">
@@ -216,6 +345,8 @@ export function HomePage() {
             <p>Scheduler: {data.scheduler?.running ? "running" : "stopped"}</p>
             <p>Last Run: {formatDateTime(data.scheduler?.last_run_at)}</p>
             <p>Last Error: {data.scheduler?.last_error ?? "-"}</p>
+            <p>Recon Reason: {reconciliation?.reason ?? "-"}</p>
+            <p>Recon Critical: {reconciliation ? String(reconciliation.within_critical_tolerance) : "-"}</p>
             <p>Warmup Reasons: {data.systemReadiness?.reasons.join(" | ") || "-"}</p>
           </div>
         </article>

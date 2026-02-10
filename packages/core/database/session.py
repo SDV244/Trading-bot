@@ -36,11 +36,20 @@ def get_engine() -> AsyncEngine:
                 url = make_url(settings.database.url)
                 if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
                     Path(url.database).parent.mkdir(parents=True, exist_ok=True)
-                _engine = create_async_engine(
-                    settings.database.url,
-                    echo=settings.log.level == "DEBUG",
-                    future=True,
-                )
+                engine_kwargs: dict[str, object] = {
+                    "echo": settings.log.level == "DEBUG",
+                    "future": True,
+                }
+                if url.get_backend_name() != "sqlite":
+                    engine_kwargs.update(
+                        {
+                            "pool_size": settings.database.pool_size,
+                            "max_overflow": settings.database.max_overflow,
+                            "pool_pre_ping": settings.database.pool_pre_ping,
+                            "pool_recycle": settings.database.pool_recycle_seconds,
+                        }
+                    )
+                _engine = create_async_engine(settings.database.url, **engine_kwargs)
     return _engine
 
 

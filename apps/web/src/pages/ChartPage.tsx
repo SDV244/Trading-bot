@@ -13,6 +13,11 @@ type Marker = {
   filledAt: string;
 };
 
+type TickPoint = {
+  timestamp: string;
+  price: number;
+};
+
 const TIMEFRAME_OPTIONS = ["1m", "5m", "15m", "1h", "4h"] as const;
 const POLL_MS = 5000;
 
@@ -38,6 +43,7 @@ export function ChartPage() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [fills, setFills] = useState<Fill[]>([]);
   const [price, setPrice] = useState<string | null>(null);
+  const [liveTicks, setLiveTicks] = useState<TickPoint[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -54,6 +60,20 @@ export function ChartPage() {
       setOrders(ordersResponse);
       setFills(fillsResponse);
       setPrice(priceResponse?.price ?? null);
+      if (priceResponse?.timestamp && Number.isFinite(Number(priceResponse.price))) {
+        const point: TickPoint = {
+          timestamp: priceResponse.timestamp,
+          price: Number(priceResponse.price),
+        };
+        setLiveTicks((prev) => {
+          const last = prev[prev.length - 1];
+          if (last?.timestamp === point.timestamp) {
+            return prev;
+          }
+          const next = [...prev, point];
+          return next.slice(-720);
+        });
+      }
       setError(null);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load chart data");
@@ -78,7 +98,9 @@ export function ChartPage() {
     const plotWidth = width - padX * 2;
     const plotHeight = height - padY * 2;
 
-    const closeValues = candles.map((item) => Number(item.close)).filter((value) => Number.isFinite(value));
+    const usingLiveTicks = candles.length < 2 && liveTicks.length >= 2;
+    const seriesValues = usingLiveTicks ? liveTicks.map((tick) => tick.price) : candles.map((item) => Number(item.close));
+    const closeValues = seriesValues.filter((value) => Number.isFinite(value));
     if (closeValues.length < 2) {
       return {
         width,
@@ -87,20 +109,22 @@ export function ChartPage() {
         min: null,
         max: null,
         markers: [] as Marker[],
+        source: usingLiveTicks ? "ticks" : "candles",
       };
     }
 
     const min = Math.min(...closeValues);
     const max = Math.max(...closeValues);
     const range = Math.max(max - min, 1e-9);
+    const pointCount = usingLiveTicks ? liveTicks.length : candles.length;
 
-    const xForIndex = (index: number): number => padX + (index / (candles.length - 1)) * plotWidth;
+    const xForIndex = (index: number): number => padX + (index / Math.max(pointCount - 1, 1)) * plotWidth;
     const yForPrice = (value: number): number => padY + ((max - value) / range) * plotHeight;
 
-    const path = candles
-      .map((item, index) => {
+    const path = closeValues
+      .map((value, index) => {
         const x = xForIndex(index);
-        const y = yForPrice(Number(item.close));
+        const y = yForPrice(value);
         return `${x},${y}`;
       })
       .join(" ");
@@ -112,7 +136,9 @@ export function ChartPage() {
       }
     });
 
-    const markers = fills
+    const markers = usingLiveTicks
+      ? []
+      : fills
       .map((fill) => {
         const fillPrice = Number(fill.price);
         const fillMs = new Date(fill.filled_at).getTime();
@@ -131,10 +157,18 @@ export function ChartPage() {
       })
       .filter((item): item is Marker => item !== null);
 
-    return { width, height, path, min, max, markers };
-  }, [candles, fills, orders]);
+    return {
+      width,
+      height,
+      path,
+      min,
+      max,
+      markers,
+      source: usingLiveTicks ? "ticks" : "candles",
+    };
+  }, [candles, fills, liveTicks, orders]);
 
-  const latestClose = candles.length > 0 ? candles[candles.length - 1]?.close : null;
+  const latestClose = candles.length > 0 ? candles[candles.length - 1]?.close : (liveTicks.length > 0 ? String(liveTicks[liveTicks.length - 1]?.price) : null);
   const recentFills = useMemo(() => fills.slice(0, 12), [fills]);
 
   return (
@@ -149,6 +183,8 @@ export function ChartPage() {
               Timeframe: {timeframe}
               {" | "}
               Candles: {candles.length}
+              {" | "}
+              Source: {chart.source === "ticks" ? "live ticks" : "cached candles"}
             </p>
           </div>
           <div className="flex items-center gap-2 text-xs">
@@ -223,7 +259,7 @@ export function ChartPage() {
           </div>
         ) : (
           <div className="mt-4 rounded-xl border border-white/10 bg-black/20 p-4 text-xs text-slate-300">
-            No candle data in cache for {timeframe}. Fetch/stream this timeframe first, or switch to `1h`/`4h`.
+            No chart data yet for {timeframe}. The page will auto-draw from live ticks as soon as price updates arrive.
           </div>
         )}
 
@@ -291,4 +327,3 @@ export function ChartPage() {
     </section>
   );
 }
-

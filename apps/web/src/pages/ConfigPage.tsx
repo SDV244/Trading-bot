@@ -18,8 +18,13 @@ export function ConfigPage() {
           <p>Require Data Ready: {String(config?.require_data_ready ?? false)}</p>
           <p>Spot Position Mode: {config?.spot_position_mode ?? "-"}</p>
           <p>AI Advisor Interval: every {config?.advisor_interval_cycles ?? "-"} cycles</p>
+          <p>Min Scheduler Interval: {config?.min_cycle_interval_seconds ?? "-"}s</p>
+          <p>Reconciliation Interval: every {config?.reconciliation_interval_cycles ?? "-"} cycles</p>
+          <p>Reconciliation Warning Tol: {formatNumber(config?.reconciliation_warning_tolerance ?? 0, 4)}</p>
+          <p>Reconciliation Critical Tol: {formatNumber(config?.reconciliation_critical_tolerance ?? 0, 4)}</p>
           <p>Paper Starting Equity: {formatNumber(config?.paper_starting_equity ?? 0, 2)} USDT</p>
           <p>Approval Timeout: {config?.approval_timeout_hours ?? "-"} hours</p>
+          <p>Auto-Approve AI Suggestions: {String(config?.approval_auto_approve_enabled ?? false)}</p>
         </div>
       </article>
       <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">

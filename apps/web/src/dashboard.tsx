@@ -6,6 +6,7 @@ import {
   type AuditEvent,
   type EquityPoint,
   type Fill,
+  type GridPreview,
   type MarketCandle,
   type MarketPrice,
   type Metrics,
@@ -35,6 +36,7 @@ type DashboardData = {
   events: AuditEvent[];
   marketCandles: MarketCandle[];
   marketPrice: MarketPrice | null;
+  gridPreview: GridPreview | null;
   lastCycle: PaperCycleResult | null;
 };
 
@@ -67,6 +69,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     events: [],
     marketCandles: [],
     marketPrice: null,
+    gridPreview: null,
     lastCycle: null,
   });
   const [loading, setLoading] = useState(true);
@@ -76,7 +79,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     try {
       const config = await api.getTradingConfig();
       const symbol = config.trading_pair;
-      const [health, ready, systemReadiness, system, scheduler, position, metrics, orders, fills, equity, approvals, events, marketCandles, marketPrice] =
+      const [health, ready, systemReadiness, system, scheduler, position, metrics, orders, fills, equity, approvals, events, marketCandles, marketPrice, gridPreview] =
         await Promise.all([
           api.health(),
           api.ready(),
@@ -92,6 +95,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
           api.listEvents({ limit: 20 }),
           api.getMarketCandles(symbol, "1h", 120).catch(() => []),
           api.getMarketPrice(symbol).catch(() => null),
+          api.getGridPreview().catch(() => null),
         ]);
       setData((prev) => ({
         ...prev,
@@ -111,6 +115,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         events,
         marketCandles,
         marketPrice,
+        gridPreview,
       }));
       setError(null);
     } catch (e) {

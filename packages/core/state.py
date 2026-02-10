@@ -171,6 +171,37 @@ class StateManager:
         self._history.append(self._current)
         return self._current
 
+    def restore(
+        self,
+        *,
+        state: SystemState,
+        reason: str,
+        changed_by: str = "system",
+        changed_at: datetime | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> StateSnapshot:
+        """
+        Restore state snapshot from persistent audit data.
+
+        This is used during API startup so in-memory state matches last known
+        audited system state.
+        """
+        normalized_changed_at = changed_at or datetime.now(UTC)
+        if normalized_changed_at.tzinfo is None:
+            normalized_changed_at = normalized_changed_at.replace(tzinfo=UTC)
+        else:
+            normalized_changed_at = normalized_changed_at.astimezone(UTC)
+        self._current = StateSnapshot(
+            state=state,
+            reason=reason,
+            changed_at=normalized_changed_at,
+            changed_by=changed_by,
+            metadata=metadata or {},
+        )
+        # On restore we want history to reflect current process lifetime.
+        self._history = [self._current]
+        return self._current
+
     def pause(self, reason: str, changed_by: str = "system") -> StateSnapshot:
         """Pause the system."""
         return self.transition_to(SystemState.PAUSED, reason, changed_by)
@@ -197,3 +228,60 @@ def get_state_manager() -> StateManager:
             if _state_manager is None:
                 _state_manager = StateManager()
     return _state_manager
+
+
+async def restore_state_from_audit(session: Any) -> StateSnapshot:
+    """
+    Restore latest system state from audit log if available.
+
+    The session is intentionally typed as Any to avoid importing SQLAlchemy
+    types at module import time.
+    """
+    from sqlalchemy import select
+
+    from packages.core.database.models import EventLog
+
+    manager = get_state_manager()
+    result = await session.execute(
+        select(EventLog)
+        .where(
+            EventLog.event_category == "system",
+            EventLog.event_type.in_(["system_state_changed", "emergency_stop_triggered"]),
+        )
+        .order_by(EventLog.created_at.desc())
+        .limit(1)
+    )
+    latest = result.scalars().first()
+    if latest is None:
+        return manager.current
+
+    details = latest.details if isinstance(latest.details, dict) else {}
+    actor = latest.actor or "system"
+    changed_at = latest.created_at
+    if changed_at.tzinfo is None:
+        changed_at = changed_at.replace(tzinfo=UTC)
+    else:
+        changed_at = changed_at.astimezone(UTC)
+
+    if latest.event_type == "emergency_stop_triggered":
+        reason = str(details.get("reason") or latest.summary or "Emergency stop triggered")
+        return manager.restore(
+            state=SystemState.EMERGENCY_STOP,
+            reason=reason,
+            changed_by=actor,
+            changed_at=changed_at,
+            metadata=details,
+        )
+
+    raw_state = str(details.get("state", "")).lower()
+    if raw_state not in {SystemState.RUNNING.value, SystemState.PAUSED.value, SystemState.EMERGENCY_STOP.value}:
+        return manager.current
+
+    reason = str(details.get("reason") or latest.summary or "State restored from audit")
+    return manager.restore(
+        state=SystemState(raw_state),
+        reason=reason,
+        changed_by=actor,
+        changed_at=changed_at,
+        metadata=details,
+    )

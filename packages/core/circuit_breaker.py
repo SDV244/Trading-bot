@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -53,7 +53,12 @@ class CircuitBreaker:
     def state(self) -> CircuitState:
         return self._state
 
-    async def call(self, func: Callable[P, T], *args: P.args, **kwargs: P.kwargs) -> T:
+    async def call(
+        self,
+        func: Callable[P, Awaitable[T]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> T:
         """Execute callable through the breaker state machine."""
         await self._before_call()
         try:

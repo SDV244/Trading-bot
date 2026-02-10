@@ -65,6 +65,7 @@ async def login(request: LoginRequest, response: Response) -> LoginResponse:
     response.headers["Pragma"] = "no-cache"
     return LoginResponse(
         access_token=token,
+        # nosec B106
         token_type="bearer",
         expires_at=datetime.fromtimestamp(exp_epoch, tz=UTC),
         role=user.role.value,
@@ -80,4 +81,3 @@ async def me(user: AuthUser = Depends(get_current_user)) -> AuthStatusResponse:
         username=user.username,
         role=user.role.value,
     )
-

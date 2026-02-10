@@ -115,6 +115,9 @@ class TelegramSettings(BaseSettings):
     chat_id: str = Field(default="", description="Chat ID for notifications")
     heartbeat_enabled: bool = Field(default=True, description="Send periodic heartbeat notifications")
     heartbeat_hours: int = Field(default=4, ge=1, le=24, description="Heartbeat interval in hours")
+    summaries_enabled: bool = Field(default=True, description="Send periodic trading summaries")
+    summary_hours: int = Field(default=6, ge=1, le=24, description="Trade summary interval in hours")
+    daily_wrap_enabled: bool = Field(default=True, description="Send 24h wrap-up summary")
 
 
 class TradingSettings(BaseSettings):
@@ -241,6 +244,30 @@ class TradingSettings(BaseSettings):
         le=1000,
         description="How often scheduler invokes AI advisor",
     )
+    min_cycle_interval_seconds: int = Field(
+        default=5,
+        ge=1,
+        le=3600,
+        description="Global minimum delay between scheduler cycles",
+    )
+    reconciliation_interval_cycles: int = Field(
+        default=30,
+        ge=0,
+        le=10_000,
+        description="Run balance reconciliation every N scheduler cycles (0 disables periodic reconciliation)",
+    )
+    reconciliation_warning_tolerance: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1_000_000.0,
+        description="Warn when absolute reconciliation difference exceeds this amount",
+    )
+    reconciliation_critical_tolerance: float = Field(
+        default=100.0,
+        ge=0.0,
+        le=10_000_000.0,
+        description="Trigger emergency stop when reconciliation difference exceeds this amount",
+    )
     paper_starting_equity: float = Field(
         default=10000.0,
         gt=0,
@@ -271,6 +298,53 @@ class ApprovalSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="APPROVAL_", extra="ignore", env_ignore_empty=True)
 
     timeout_hours: int = Field(default=2, description="Approval timeout in hours")
+    auto_approve_enabled: bool = Field(
+        default=False,
+        description="Automatically approve AI proposals immediately after creation",
+    )
+
+
+class LLMSettings(BaseSettings):
+    """LLM advisor provider configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="LLM_", extra="ignore", env_ignore_empty=True)
+
+    enabled: bool = Field(default=False, description="Enable external LLM-driven AI proposals")
+    provider: str = Field(
+        default="openai",
+        pattern="^(openai|anthropic|gemini|ollama)$",
+        description="LLM provider key",
+    )
+    model: str = Field(default="gpt-4.1-mini", description="Provider model name")
+    api_key: str = Field(default="", description="Provider API key (not required for local Ollama)")
+    base_url: str = Field(default="", description="Optional provider base URL override")
+    timeout_seconds: int = Field(default=20, ge=5, le=120, description="LLM request timeout")
+    max_retries: int = Field(default=2, ge=0, le=5, description="LLM request retry attempts")
+    temperature: float = Field(default=0.15, ge=0.0, le=1.0, description="Sampling temperature")
+    max_output_tokens: int = Field(default=1200, ge=128, le=8192, description="Response token budget")
+    max_proposals: int = Field(default=3, ge=1, le=10, description="Max proposals returned per cycle")
+    min_confidence: float = Field(
+        default=0.55,
+        ge=0.0,
+        le=1.0,
+        description="Minimum confidence required to accept an LLM proposal",
+    )
+    prefer_llm: bool = Field(
+        default=True,
+        description="When true, prefer LLM proposals over heuristic proposals",
+    )
+    fallback_to_rules: bool = Field(
+        default=True,
+        description="Fallback to built-in rule proposals when LLM returns no valid proposals",
+    )
+    system_prompt: str = Field(
+        default=(
+            "You are a senior crypto spot-grid risk advisor. Output strict JSON only. "
+            "Never propose disabling safety controls or bypassing approvals. "
+            "Propose parameter diffs only."
+        ),
+        description="System prompt prefix for LLM advisor",
+    )
 
 
 class APISettings(BaseSettings):
@@ -284,11 +358,37 @@ class APISettings(BaseSettings):
         default="http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173",
         description="Comma-separated CORS allowlist",
     )
+    rate_limit_enabled: bool = Field(default=True, description="Enable in-process API rate limiting")
+    rate_limit_requests_per_minute: int = Field(
+        default=600,
+        ge=30,
+        le=100000,
+        description="General API requests per minute per client",
+    )
+    rate_limit_auth_requests_per_minute: int = Field(
+        default=60,
+        ge=5,
+        le=50000,
+        description="Auth endpoint requests per minute per client",
+    )
+    rate_limit_exempt_paths: str = Field(
+        default="/health,/ready,/metrics,/docs,/openapi.json,/redoc",
+        description="Comma-separated list of route prefixes exempt from rate limiting",
+    )
 
     @property
     def allow_origin_list(self) -> list[str]:
         """Parse CORS allowlist."""
         return [origin.strip() for origin in self.allowed_origins.split(",") if origin.strip()]
+
+    @property
+    def rate_limit_exempt_path_list(self) -> list[str]:
+        """Parse rate limit exempt prefixes."""
+        return [
+            path.strip()
+            for path in self.rate_limit_exempt_paths.split(",")
+            if path.strip()
+        ]
 
 
 class AppRuntimeSettings(BaseSettings):
@@ -313,6 +413,15 @@ class DatabaseSettings(BaseSettings):
         description="Database connection URL",
     )
     auto_migrate: bool = Field(default=True, description="Run Alembic migrations at startup")
+    pool_size: int = Field(default=20, ge=1, le=200, description="Connection pool size")
+    max_overflow: int = Field(default=10, ge=0, le=200, description="Extra transient DB connections")
+    pool_pre_ping: bool = Field(default=True, description="Validate pooled connections before use")
+    pool_recycle_seconds: int = Field(
+        default=3600,
+        ge=30,
+        le=86_400,
+        description="Recycle pooled connections after N seconds",
+    )
 
 
 class LogSettings(BaseSettings):
@@ -321,6 +430,26 @@ class LogSettings(BaseSettings):
     model_config = SettingsConfigDict(extra="ignore", env_ignore_empty=True)
 
     level: str = Field(default="INFO", alias="LOG_LEVEL", description="Log level")
+
+
+class WebhookSettings(BaseSettings):
+    """Generic webhook alerting configuration (Discord/Slack/etc)."""
+
+    model_config = SettingsConfigDict(env_prefix="WEBHOOK_", extra="ignore", env_ignore_empty=True)
+
+    enabled: bool = Field(default=False, description="Enable outbound webhook notifications")
+    url: str = Field(default="", description="Webhook target URL")
+    timeout_seconds: int = Field(default=10, ge=1, le=60, description="Webhook request timeout")
+    max_retries: int = Field(default=2, ge=0, le=10, description="Webhook retry attempts")
+    critical_only: bool = Field(default=True, description="Send only critical events to webhook")
+
+
+class ObservabilitySettings(BaseSettings):
+    """Metrics and runtime observability settings."""
+
+    model_config = SettingsConfigDict(env_prefix="OBS_", extra="ignore", env_ignore_empty=True)
+
+    metrics_enabled: bool = Field(default=True, description="Expose Prometheus metrics endpoint")
 
 
 class LiveExecutionSettings(BaseSettings):
@@ -366,9 +495,12 @@ class Settings(BaseSettings):
     trading: TradingSettings = Field(default_factory=TradingSettings)
     risk: RiskSettings = Field(default_factory=RiskSettings)
     approval: ApprovalSettings = Field(default_factory=ApprovalSettings)
+    llm: LLMSettings = Field(default_factory=LLMSettings)
     api: APISettings = Field(default_factory=APISettings)
     database: DatabaseSettings = Field(default_factory=DatabaseSettings)
     log: LogSettings = Field(default_factory=LogSettings)
+    webhook: WebhookSettings = Field(default_factory=WebhookSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     live: LiveExecutionSettings = Field(default_factory=LiveExecutionSettings)
     auth: AuthSettings = Field(default_factory=AuthSettings)
 
@@ -395,6 +527,40 @@ def reload_settings() -> Settings:
     with _settings_lock:
         _settings = _load_settings()
         return _settings
+
+
+def apply_runtime_config_patch(patch: dict[str, Any]) -> dict[str, list[str]]:
+    """
+    Apply a validated runtime patch to in-memory settings.
+
+    This does not persist to .env files. It updates only known sections/keys and
+    re-validates each updated settings section before replacing it.
+    """
+    settings = get_settings()
+    applied: dict[str, list[str]] = {}
+    with _settings_lock:
+        for section_name, section_patch in patch.items():
+            if not isinstance(section_patch, dict):
+                continue
+            section = getattr(settings, section_name, None)
+            if not isinstance(section, BaseSettings):
+                continue
+
+            merged = section.model_dump()
+            changed_keys: list[str] = []
+            for key, value in section_patch.items():
+                if key not in merged:
+                    continue
+                if merged[key] != value:
+                    changed_keys.append(key)
+                merged[key] = value
+            if not changed_keys:
+                continue
+
+            updated_section = section.__class__(**cast(dict[str, Any], merged))
+            setattr(settings, section_name, updated_section)
+            applied[section_name] = sorted(changed_keys)
+    return applied
 
 
 def _build_settings_section(
@@ -432,9 +598,12 @@ def _load_settings() -> Settings:
         trading=_build_settings_section(TradingSettings, settings_kwargs),
         risk=_build_settings_section(RiskSettings, settings_kwargs),
         approval=_build_settings_section(ApprovalSettings, settings_kwargs),
+        llm=_build_settings_section(LLMSettings, settings_kwargs),
         api=_build_settings_section(APISettings, settings_kwargs),
         database=_build_settings_section(DatabaseSettings, settings_kwargs),
         log=_build_settings_section(LogSettings, settings_kwargs),
+        webhook=_build_settings_section(WebhookSettings, settings_kwargs),
+        observability=_build_settings_section(ObservabilitySettings, settings_kwargs),
         live=_build_settings_section(LiveExecutionSettings, settings_kwargs),
         auth=_build_settings_section(AuthSettings, settings_kwargs),
     )

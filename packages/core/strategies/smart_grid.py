@@ -132,7 +132,8 @@ class SmartAdaptiveGridStrategy(Strategy):
         if step <= 0:
             return Signal(side="HOLD", confidence=0.0, reason="invalid_grid_step", indicators={})
 
-        half_levels = Decimal(str(max(1, self.grid_levels // 2)))
+        levels_each_side = max(1, self.grid_levels // 2)
+        half_levels = Decimal(str(levels_each_side))
         upper_band = tilted_center + (step * half_levels)
         lower_band = tilted_center - (step * half_levels)
         buy_trigger = tilted_center - step
@@ -159,6 +160,9 @@ class SmartAdaptiveGridStrategy(Strategy):
             "sell_trigger": float(sell_trigger),
             "recenter_mode_aggressive": 1.0 if recenter_mode == "aggressive" else 0.0,
         }
+        for level in range(1, levels_each_side + 1):
+            indicators[f"grid_buy_level_{level}"] = float(tilted_center - (step * Decimal(level)))
+            indicators[f"grid_sell_level_{level}"] = float(tilted_center + (step * Decimal(level)))
 
         if self.take_profit_buffer > 0:
             take_profit_trigger = upper_band * (Decimal("1") + Decimal(str(self.take_profit_buffer)))

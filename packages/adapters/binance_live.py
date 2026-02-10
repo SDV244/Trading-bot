@@ -35,7 +35,10 @@ class BinanceLiveAdapter:
         self.base_url = settings.binance.trading_base_url
         self._client: httpx.AsyncClient | None = None
         self._request_lock = asyncio.Lock()
+        self._time_sync_lock = asyncio.Lock()
         self._last_request_ts = 0.0
+        self._server_time_offset_ms = 0
+        self._last_time_sync_monotonic: float | None = None
         self._circuit_breaker = CircuitBreaker(
             "binance_live",
             CircuitBreakerConfig(
@@ -50,13 +53,15 @@ class BinanceLiveAdapter:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            if self._client is not None and not self._client.is_closed:
-                await self._client.aclose()
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
                 timeout=httpx.Timeout(20.0, connect=5.0),
                 headers={"X-MBX-APIKEY": self.api_key},
                 limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+                event_hooks={
+                    "request": [self._log_request_safe],
+                    "response": [self._log_response_safe],
+                },
             )
         return self._client
 
@@ -80,6 +85,7 @@ class BinanceLiveAdapter:
         recv_window_ms = recv_window or self.settings.live.recv_window_ms
         max_retries = max(1, self.settings.live.max_retries)
         client = await self._get_client()
+        await self._sync_time()
 
         last_error: str | None = None
         for attempt in range(max_retries):
@@ -89,7 +95,7 @@ class BinanceLiveAdapter:
                 "type": "MARKET",
                 "quantity": str(quantity),
                 "recvWindow": recv_window_ms,
-                "timestamp": int(time.time() * 1000),
+                "timestamp": self._timestamp_ms(),
                 "newClientOrderId": client_order_id,
             }
             signed = self._sign_params(params)
@@ -107,6 +113,11 @@ class BinanceLiveAdapter:
             if response.status_code < 400:
                 return cast(dict[str, Any], response.json())
 
+            if self._binance_error_code(response) == -1021 and attempt < max_retries - 1:
+                await self._sync_time(force=True)
+                await asyncio.sleep(self._retry_delay(attempt))
+                continue
+
             if response.status_code in {429, 500, 502, 503, 504} and attempt < max_retries - 1:
                 retry_after = response.headers.get("Retry-After")
                 delay = float(retry_after) if retry_after else self._retry_delay(attempt)
@@ -114,7 +125,8 @@ class BinanceLiveAdapter:
                 await asyncio.sleep(delay)
                 continue
 
-            msg = f"Binance order failed: {response.status_code} {response.text}"
+            safe_text = self._sanitize_text(response.text)
+            msg = f"Binance order failed: {response.status_code} {safe_text}"
             logger.error(msg)
             raise BinanceLiveAdapterError(msg)
 
@@ -125,7 +137,8 @@ class BinanceLiveAdapter:
         client = await self._get_client()
         response = await self._circuit_breaker.call(client.get, "/api/v3/exchangeInfo", params={"symbol": symbol})
         if response.status_code >= 400:
-            msg = f"Binance exchangeInfo failed: {response.status_code} {response.text}"
+            safe_text = self._sanitize_text(response.text)
+            msg = f"Binance exchangeInfo failed: {response.status_code} {safe_text}"
             raise BinanceLiveAdapterError(msg)
         data = response.json()
         symbols = data.get("symbols", [])
@@ -143,11 +156,12 @@ class BinanceLiveAdapter:
         """Query order by client order id for idempotent recovery checks."""
         recv_window_ms = recv_window or self.settings.live.recv_window_ms
         client = await self._get_client()
+        await self._sync_time()
         params: dict[str, Any] = {
             "symbol": symbol,
             "origClientOrderId": client_order_id,
             "recvWindow": recv_window_ms,
-            "timestamp": int(time.time() * 1000),
+            "timestamp": self._timestamp_ms(),
         }
         signed = self._sign_params(params)
         await self._throttle()
@@ -157,10 +171,62 @@ class BinanceLiveAdapter:
             raise BinanceLiveAdapterError("Binance query order request error") from e
         if response.status_code == 404:
             return None
+        if self._binance_error_code(response) == -1021:
+            await self._sync_time(force=True)
+            params["timestamp"] = self._timestamp_ms()
+            signed = self._sign_params(params)
+            response = await self._circuit_breaker.call(client.get, "/api/v3/order", params=signed)
+            if response.status_code == 404:
+                return None
         if response.status_code >= 400:
-            msg = f"Binance query order failed: {response.status_code} {response.text}"
+            safe_text = self._sanitize_text(response.text)
+            msg = f"Binance query order failed: {response.status_code} {safe_text}"
             raise BinanceLiveAdapterError(msg)
         return cast(dict[str, Any], response.json())
+
+    async def get_account_balances(
+        self,
+        *,
+        recv_window: int | None = None,
+    ) -> dict[str, Decimal]:
+        """Fetch account balances by asset (free + locked)."""
+        recv_window_ms = recv_window or self.settings.live.recv_window_ms
+        client = await self._get_client()
+        await self._sync_time()
+        params: dict[str, Any] = {
+            "recvWindow": recv_window_ms,
+            "timestamp": self._timestamp_ms(),
+        }
+        signed = self._sign_params(params)
+        await self._throttle()
+        response = await self._circuit_breaker.call(client.get, "/api/v3/account", params=signed)
+        if self._binance_error_code(response) == -1021:
+            await self._sync_time(force=True)
+            params["timestamp"] = self._timestamp_ms()
+            signed = self._sign_params(params)
+            response = await self._circuit_breaker.call(client.get, "/api/v3/account", params=signed)
+        if response.status_code >= 400:
+            safe_text = self._sanitize_text(response.text)
+            raise BinanceLiveAdapterError(
+                f"Binance account endpoint failed: {response.status_code} {safe_text}"
+            )
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise BinanceLiveAdapterError("Binance account response malformed")
+        balances = payload.get("balances")
+        if not isinstance(balances, list):
+            raise BinanceLiveAdapterError("Binance account balances payload missing")
+        parsed: dict[str, Decimal] = {}
+        for raw in balances:
+            if not isinstance(raw, dict):
+                continue
+            asset = str(raw.get("asset", "")).upper()
+            if not asset:
+                continue
+            free = Decimal(str(raw.get("free", "0")))
+            locked = Decimal(str(raw.get("locked", "0")))
+            parsed[asset] = free + locked
+        return parsed
 
     def _sign_params(self, params: dict[str, Any]) -> dict[str, Any]:
         query_string = urlencode(params)
@@ -182,6 +248,37 @@ class BinanceLiveAdapter:
                 await asyncio.sleep(interval_seconds - elapsed)
             self._last_request_ts = time.monotonic()
 
+    async def _sync_time(self, *, force: bool = False) -> None:
+        if not force and not self._needs_time_sync():
+            return
+        async with self._time_sync_lock:
+            if not force and not self._needs_time_sync():
+                return
+            client = await self._get_client()
+            await self._throttle()
+            response = await self._circuit_breaker.call(client.get, "/api/v3/time")
+            if response.status_code >= 400:
+                safe_text = self._sanitize_text(response.text)
+                raise BinanceLiveAdapterError(
+                    f"Binance time sync failed: {response.status_code} {safe_text}"
+                )
+            payload = response.json()
+            if not isinstance(payload, dict) or "serverTime" not in payload:
+                raise BinanceLiveAdapterError("Binance time sync returned malformed payload")
+            server_time = int(payload["serverTime"])
+            local_time = int(time.time() * 1000)
+            self._server_time_offset_ms = server_time - local_time
+            self._last_time_sync_monotonic = time.monotonic()
+            logger.debug(f"Binance live time synced (offset_ms={self._server_time_offset_ms})")
+
+    def _needs_time_sync(self) -> bool:
+        if self._last_time_sync_monotonic is None:
+            return True
+        return (time.monotonic() - self._last_time_sync_monotonic) >= 3600
+
+    def _timestamp_ms(self) -> int:
+        return int(time.time() * 1000) + self._server_time_offset_ms
+
     @staticmethod
     def _retry_delay(attempt: int) -> float:
         return float(min(0.5 * (2**attempt), 5.0))
@@ -193,9 +290,43 @@ class BinanceLiveAdapter:
 
     @staticmethod
     def _sanitize_text(value: str) -> str:
+        if not value:
+            return value
         sanitized = re.sub(r"signature=[^&\\s]+", "signature=REDACTED", value)
         sanitized = re.sub(r"X-MBX-APIKEY=[^&\\s]+", "X-MBX-APIKEY=REDACTED", sanitized)
+        sanitized = re.sub(r"api[_-]?key\"?\s*[:=]\s*\"?[A-Za-z0-9_\-]+", "api_key=REDACTED", sanitized, flags=re.IGNORECASE)
+        sanitized = re.sub(r"api[_-]?secret\"?\s*[:=]\s*\"?[A-Za-z0-9_\-]+", "api_secret=REDACTED", sanitized, flags=re.IGNORECASE)
         return sanitized
+
+    @staticmethod
+    def _binance_error_code(response: httpx.Response) -> int | None:
+        try:
+            payload = response.json()
+        except Exception:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        code = payload.get("code")
+        if isinstance(code, int):
+            return code
+        return None
+
+    async def _log_request_safe(self, request: httpx.Request) -> None:
+        logger.debug(f"Binance live request {request.method} {request.url.path}")
+
+    async def _log_response_safe(self, response: httpx.Response) -> None:
+        request = response.request
+        logger.debug(
+            f"Binance live response {response.status_code} {request.method} {request.url.path}"
+        )
+
+    def get_circuit_breaker_stats(self) -> dict[str, Any]:
+        """Expose current circuit-breaker state for diagnostics."""
+        return self._circuit_breaker.get_stats()
+
+    async def reset_circuit_breaker(self) -> None:
+        """Reset circuit-breaker state to CLOSED."""
+        await self._circuit_breaker.reset()
 
 
 _live_adapter: BinanceLiveAdapter | None = None

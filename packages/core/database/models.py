@@ -20,6 +20,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -54,6 +55,15 @@ class OrderStatus(str, Enum):
     FILLED = "FILLED"
     CANCELLED = "CANCELLED"
     REJECTED = "REJECTED"
+
+
+class OrderAttemptStatus(str, Enum):
+    """Order attempt status for idempotent live execution tracking."""
+
+    PENDING = "PENDING"
+    SENT = "SENT"
+    CONFIRMED = "CONFIRMED"
+    FAILED = "FAILED"
 
 
 class ApprovalStatus(str, Enum):
@@ -157,6 +167,7 @@ class Order(Base):
     __table_args__ = (
         Index("idx_orders_symbol_status", "symbol", "status"),
         Index("idx_orders_created", "created_at"),
+        Index("idx_orders_paper_symbol_created", "is_paper", "symbol", "created_at"),
     )
 
 
@@ -183,7 +194,44 @@ class Fill(Base):
     # Relationships
     order: Mapped["Order"] = relationship("Order", back_populates="fills")
 
-    __table_args__ = (Index("idx_fills_order", "order_id"),)
+    __table_args__ = (
+        Index("idx_fills_order", "order_id"),
+        Index("idx_fills_paper_time", "is_paper", "filled_at"),
+    )
+
+
+class OrderAttempt(Base):
+    """Live order attempt tracking for idempotent execution."""
+
+    __tablename__ = "order_attempts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    idempotency_key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
+    side: Mapped[str] = mapped_column(String(10), nullable=False)
+    order_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    quantity: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default=OrderAttemptStatus.PENDING)
+    client_order_id: Mapped[str] = mapped_column(String(50), nullable=False)
+    exchange_order_id: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_order_attempts_status_created", "status", "created_at"),
+        Index("idx_order_attempts_symbol_created", "symbol", "created_at"),
+    )
 
 
 # ============================================================================
@@ -197,7 +245,7 @@ class Position(Base):
     __tablename__ = "positions"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    symbol: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(20), nullable=False)
     side: Mapped[str | None] = mapped_column(String(10), nullable=True)  # None = no position
     quantity: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False, default=0)
     avg_entry_price: Mapped[Decimal] = mapped_column(Numeric(20, 8), nullable=False, default=0)
@@ -210,6 +258,11 @@ class Position(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+    __table_args__ = (
+        UniqueConstraint("symbol", "is_paper", name="uq_positions_symbol_is_paper"),
+        Index("idx_positions_paper_symbol", "is_paper", "symbol"),
     )
 
 

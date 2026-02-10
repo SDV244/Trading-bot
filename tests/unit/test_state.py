@@ -2,9 +2,14 @@
 Tests for state management.
 """
 
-import pytest
+from datetime import UTC, datetime
 
-from packages.core.state import StateManager, SystemState
+import pytest
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+import packages.core.state as state_module
+from packages.core.database.models import Base, EventLog
+from packages.core.state import StateManager, SystemState, restore_state_from_audit
 
 
 class TestStateManager:
@@ -86,3 +91,66 @@ class TestStateManager:
         snapshot1 = manager.current
         snapshot2 = manager.transition_to(SystemState.PAUSED, "Same state", "test")
         assert snapshot1 == snapshot2
+
+
+@pytest.fixture
+async def db_session() -> AsyncSession:
+    """Create in-memory async database session for restore tests."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    sf = async_sessionmaker(bind=engine, class_=AsyncSession, expire_on_commit=False)
+    async with sf() as session:
+        yield session
+
+
+@pytest.fixture(autouse=True)
+def reset_global_state_manager() -> None:
+    """Reset global state manager singleton between tests."""
+    state_module._state_manager = state_module.StateManager()  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_restore_state_from_audit_restores_emergency_stop(db_session: AsyncSession) -> None:
+    db_session.add(
+        EventLog(
+            event_type="emergency_stop_triggered",
+            event_category="system",
+            summary="Emergency stop due to expired approvals",
+            details={"reason": "Approval timeout (1 expired)"},
+            inputs={},
+            config_version=1,
+            actor="approval_gate",
+            created_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    snapshot = await restore_state_from_audit(db_session)
+    assert snapshot.state == SystemState.EMERGENCY_STOP
+    assert snapshot.reason == "Approval timeout (1 expired)"
+    assert snapshot.changed_by == "approval_gate"
+    assert state_module.get_state_manager().is_emergency_stopped
+
+
+@pytest.mark.asyncio
+async def test_restore_state_from_audit_restores_running_state(db_session: AsyncSession) -> None:
+    db_session.add(
+        EventLog(
+            event_type="system_state_changed",
+            event_category="system",
+            summary="State changed to running: resume",
+            details={"state": "running", "reason": "resume"},
+            inputs={},
+            config_version=1,
+            actor="operator",
+            created_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    snapshot = await restore_state_from_audit(db_session)
+    assert snapshot.state == SystemState.RUNNING
+    assert snapshot.reason == "resume"
+    assert snapshot.changed_by == "operator"
+    assert state_module.get_state_manager().is_running

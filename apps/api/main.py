@@ -12,16 +12,19 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
+from apps.api.middleware.rate_limit import RateLimitMiddleware
 from apps.api.middleware.request_id import RequestIDMiddleware
 from apps.api.middleware.security_headers import SecurityHeadersMiddleware
 from apps.api.routers import ai, auth, health, market, system, trading
 from packages.adapters.binance_live import close_binance_live_adapter
 from packages.adapters.binance_spot import close_binance_adapter
+from packages.adapters.webhook_notifier import close_webhook_notifier
 from packages.core.config import get_settings
 from packages.core.database.migrations import run_migrations
-from packages.core.database.session import close_database, init_database
+from packages.core.database.session import close_database, get_session, init_database
 from packages.core.logging_setup import configure_logging
 from packages.core.scheduler import close_trading_scheduler
+from packages.core.state import restore_state_from_audit
 
 
 @asynccontextmanager
@@ -39,6 +42,9 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await init_database()
     if settings.database.auto_migrate:
         await asyncio.to_thread(run_migrations)
+    async with get_session() as session:
+        restored = await restore_state_from_audit(session)
+    logger.info(f"System state restored: {restored.state.value} ({restored.reason})")
     logger.info("Database initialized")
 
     yield
@@ -47,6 +53,7 @@ async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await close_trading_scheduler()
     await close_binance_live_adapter()
     await close_binance_adapter()
+    await close_webhook_notifier()
     await close_database()
     logger.info("Database connections closed")
 
@@ -73,6 +80,7 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
     )
+    app.add_middleware(RateLimitMiddleware)
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(SecurityHeadersMiddleware)
 

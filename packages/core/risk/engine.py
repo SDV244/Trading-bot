@@ -64,13 +64,25 @@ class RiskEngine:
         if self._daily_loss_exceeded(risk_input):
             return self._hold("max_daily_loss_exceeded")
 
+        is_sell = signal.side == "SELL"
         max_notional = self.config.max_exposure * risk_input.equity
         available_notional = max_notional - risk_input.current_exposure_notional
-        if available_notional <= 0:
+        if not is_sell and available_notional <= 0:
             return self._hold("max_exposure_reached")
+        if is_sell and risk_input.current_exposure_notional <= 0:
+            return self._hold("no_exposure_to_reduce")
 
         risk_budget_notional = self.config.risk_per_trade * risk_input.equity
-        trade_notional = min(risk_budget_notional, available_notional)
+        if is_sell:
+            # SELL orders reduce exposure and should not be blocked by max_exposure
+            # guard. Cap size by current exposure when known.
+            trade_notional = max(risk_budget_notional, self.config.min_notional)
+            trade_notional = min(
+                trade_notional,
+                max(risk_input.current_exposure_notional, Decimal("0")),
+            )
+        else:
+            trade_notional = min(risk_budget_notional, available_notional)
         if trade_notional < self.config.min_notional:
             return self._reject("below_min_notional")
 

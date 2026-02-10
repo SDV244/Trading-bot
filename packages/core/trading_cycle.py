@@ -3,7 +3,7 @@
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_DOWN, Decimal
+from decimal import ROUND_DOWN, ROUND_UP, Decimal
 from typing import Literal, cast
 from uuid import uuid4
 
@@ -11,7 +11,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from packages.adapters.telegram_bot import get_telegram_notifier
-from packages.core.audit import log_event
+from packages.adapters.webhook_notifier import get_webhook_notifier
+from packages.core.audit import log_event, resolve_active_config_version
 from packages.core.config import get_settings
 from packages.core.database.models import (
     Candle,
@@ -22,7 +23,13 @@ from packages.core.database.models import (
     Position,
 )
 from packages.core.database.repositories import CandleRepository
-from packages.core.execution.paper_engine import OrderRequest, PaperEngine, PaperFill
+from packages.core.execution.paper_engine import (
+    OrderRequest,
+    PaperEngine,
+    PaperExecutionError,
+    PaperFill,
+)
+from packages.core.metrics.calculator import MetricsCalculator
 from packages.core.risk.engine import RiskConfig, RiskEngine, RiskInput
 from packages.core.risk.global_stop_loss import GlobalStopLossConfig, GlobalStopLossGuard
 from packages.core.state import get_state_manager
@@ -65,6 +72,42 @@ class DataReadiness:
     data_ready: bool
     reasons: list[str]
     timeframes: dict[str, TimeframeReadiness]
+
+
+@dataclass(slots=True, frozen=True)
+class GridLevel:
+    """One projected smart-grid level."""
+
+    level: int
+    price: Decimal
+    distance_bps: Decimal
+
+
+@dataclass(slots=True, frozen=True)
+class GridPreview:
+    """Snapshot of smart-grid projected levels and triggers."""
+
+    symbol: str
+    strategy: str
+    last_price: Decimal
+    signal_side: str
+    signal_reason: str
+    confidence: float
+    grid_center: Decimal | None
+    grid_upper: Decimal | None
+    grid_lower: Decimal | None
+    buy_trigger: Decimal | None
+    sell_trigger: Decimal | None
+    spacing_bps: float | None
+    grid_step: Decimal | None
+    recentered: bool
+    recenter_mode: str
+    buy_levels: list[GridLevel]
+    sell_levels: list[GridLevel]
+    take_profit_trigger: Decimal | None
+    stop_loss_trigger: Decimal | None
+    position_quantity: Decimal
+    bootstrap_eligible: bool
 
 
 class TradingCycleService:
@@ -207,6 +250,59 @@ class TradingCycleService:
         """Return normalized candle requirements for the active strategy."""
         return dict(self.strategy_requirements)
 
+    async def get_grid_preview(self, session: AsyncSession) -> GridPreview | None:
+        """Build smart-grid level preview for operator visibility."""
+        if self.strategy.name != "smart_grid_ai":
+            return None
+
+        context = await self._load_strategy_context(session)
+        if context is None or len(context.candles_1h) == 0:
+            return None
+
+        signal = self.strategy.generate_signal(context)
+        indicators = signal.indicators
+        last_price = context.candles_1h[-1].close
+
+        position_result = await session.execute(
+            select(Position).where(
+                Position.symbol == self.symbol,
+                Position.is_paper.is_(True),
+            )
+        )
+        position = position_result.scalar_one_or_none()
+        quantity = Decimal("0") if position is None else Decimal(str(position.quantity))
+
+        bootstrap_eligible = await self._is_bootstrap_candidate(
+            session=session,
+            signal_side=signal.side,
+            signal_reason=signal.reason,
+            current_quantity=quantity,
+        )
+
+        return GridPreview(
+            symbol=self.symbol,
+            strategy=self.strategy.name,
+            last_price=last_price,
+            signal_side=signal.side,
+            signal_reason=signal.reason,
+            confidence=signal.confidence,
+            grid_center=self._decimal_indicator(indicators, "grid_center"),
+            grid_upper=self._decimal_indicator(indicators, "grid_upper"),
+            grid_lower=self._decimal_indicator(indicators, "grid_lower"),
+            buy_trigger=self._decimal_indicator(indicators, "buy_trigger"),
+            sell_trigger=self._decimal_indicator(indicators, "sell_trigger"),
+            spacing_bps=self._float_indicator(indicators, "spacing_bps"),
+            grid_step=self._decimal_indicator(indicators, "grid_step"),
+            recentered=(self._float_indicator(indicators, "recentered") or 0.0) > 0.0,
+            recenter_mode=self.settings.trading.grid_recenter_mode,
+            buy_levels=self._extract_grid_levels(indicators, "grid_buy_level_", last_price),
+            sell_levels=self._extract_grid_levels(indicators, "grid_sell_level_", last_price),
+            take_profit_trigger=self._decimal_indicator(indicators, "take_profit_trigger"),
+            stop_loss_trigger=self._decimal_indicator(indicators, "stop_loss_trigger"),
+            position_quantity=quantity,
+            bootstrap_eligible=bootstrap_eligible,
+        )
+
     @staticmethod
     def _build_hold_result(
         symbol: str,
@@ -226,6 +322,50 @@ class TradingCycleService:
             quantity="0",
             price=None,
         )
+
+    @staticmethod
+    def _float_indicator(indicators: dict[str, float], key: str) -> float | None:
+        raw = indicators.get(key)
+        if isinstance(raw, int | float):
+            return float(raw)
+        return None
+
+    @classmethod
+    def _decimal_indicator(cls, indicators: dict[str, float], key: str) -> Decimal | None:
+        raw = cls._float_indicator(indicators, key)
+        if raw is None:
+            return None
+        return Decimal(str(raw))
+
+    @staticmethod
+    def _extract_grid_levels(
+        indicators: dict[str, float],
+        prefix: str,
+        reference_price: Decimal,
+    ) -> list[GridLevel]:
+        levels: list[GridLevel] = []
+        if reference_price <= 0:
+            return levels
+        for key, raw_value in indicators.items():
+            if not key.startswith(prefix):
+                continue
+            level_token = key.removeprefix(prefix)
+            if not level_token.isdigit():
+                continue
+            if not isinstance(raw_value, int | float):
+                continue
+            level = int(level_token)
+            level_price = Decimal(str(raw_value))
+            distance_bps = ((level_price - reference_price) / reference_price) * Decimal("10000")
+            levels.append(
+                GridLevel(
+                    level=level,
+                    price=level_price,
+                    distance_bps=distance_bps,
+                )
+            )
+        levels.sort(key=lambda item: item.level)
+        return levels
 
     async def run_once(self, session: AsyncSession) -> CycleResult:
         state = get_state_manager()
@@ -271,6 +411,16 @@ class TradingCycleService:
 
         signal = self.strategy.generate_signal(context)
         await self._maybe_alert_out_of_bounds(session, signal, last_price)
+        if position.quantity <= 0:
+            bootstrap = await self._maybe_bootstrap_inventory(
+                session=session,
+                position=position,
+                mark_price=last_price,
+                signal_side=signal.side,
+                signal_reason=signal.reason,
+            )
+            if bootstrap is not None:
+                return bootstrap
         if self.grid_cooldown_seconds > 0 and signal.side in {"BUY", "SELL"}:
             remaining_cooldown = await self._cooldown_remaining_seconds(session)
             if remaining_cooldown > 0:
@@ -278,7 +428,6 @@ class TradingCycleService:
                     session=session,
                     position=position,
                     mark_price=last_price,
-                    realized_delta=Decimal("0"),
                 )
                 return self._build_hold_result(
                     symbol=self.symbol,
@@ -288,19 +437,10 @@ class TradingCycleService:
                 )
 
         if signal.side == "SELL" and position.quantity <= 0:
-            bootstrap = await self._maybe_bootstrap_inventory(
-                session=session,
-                position=position,
-                mark_price=last_price,
-                signal_reason=signal.reason,
-            )
-            if bootstrap is not None:
-                return bootstrap
             await self._persist_cycle_snapshot(
                 session=session,
                 position=position,
                 mark_price=last_price,
-                realized_delta=Decimal("0"),
             )
             return self._build_hold_result(
                 symbol=self.symbol,
@@ -314,7 +454,6 @@ class TradingCycleService:
                 session=session,
                 position=position,
                 mark_price=last_price,
-                realized_delta=Decimal("0"),
             )
             return self._build_hold_result(
                 symbol=self.symbol,
@@ -325,7 +464,7 @@ class TradingCycleService:
 
         equity = await self._get_current_equity(session)
         current_exposure = position.quantity * last_price
-        daily_pnl = Decimal("0")
+        daily_pnl = await self._compute_daily_realized_pnl(session)
 
         risk_decision = self.risk_engine.evaluate(
             signal=signal,
@@ -354,7 +493,6 @@ class TradingCycleService:
                 session=session,
                 position=position,
                 mark_price=last_price,
-                realized_delta=Decimal("0"),
             )
             return self._build_hold_result(
                 symbol=self.symbol,
@@ -368,7 +506,6 @@ class TradingCycleService:
                 session=session,
                 position=position,
                 mark_price=last_price,
-                realized_delta=Decimal("0"),
             )
             return CycleResult(
                 symbol=self.symbol,
@@ -395,7 +532,6 @@ class TradingCycleService:
                     session=session,
                     position=position,
                     mark_price=last_price,
-                    realized_delta=Decimal("0"),
                 )
                 return self._build_hold_result(
                     symbol=self.symbol,
@@ -413,6 +549,48 @@ class TradingCycleService:
             signal_reason=signal.reason,
             risk_action=risk_decision.action,
             risk_reason=risk_decision.reason,
+            signal_indicators=signal.indicators,
+            candle_low=context.candles_1h[-1].low,
+            candle_high=context.candles_1h[-1].high,
+        )
+
+    async def close_open_paper_position(
+        self,
+        session: AsyncSession,
+        *,
+        reason: str = "manual_close_all_positions",
+        actor: str = "system",
+    ) -> CycleResult:
+        """Force-close the current paper position, if any."""
+        position = await self._get_or_create_position(session)
+        quantity = Decimal(str(position.quantity))
+        if quantity <= 0:
+            await log_event(
+                session,
+                event_type="paper_close_position_noop",
+                event_category="trade",
+                summary="Close-all-positions requested but no paper inventory is open",
+                details={"symbol": self.symbol, "reason": reason},
+                actor=actor,
+            )
+            return self._build_hold_result(
+                symbol=self.symbol,
+                signal_side="SELL",
+                signal_reason=reason,
+                risk_reason="no_inventory_to_sell",
+            )
+
+        fallback_price = Decimal(str(position.avg_entry_price))
+        mark_price = await self._resolve_mark_price(session, fallback_price=fallback_price)
+        return await self._execute_paper_trade(
+            session=session,
+            position=position,
+            trade_side="SELL",
+            quantity=quantity,
+            mark_price=mark_price,
+            signal_reason=reason,
+            risk_action="FORCE_CLOSE",
+            risk_reason=reason,
         )
 
     async def _check_global_stop_loss(
@@ -477,6 +655,15 @@ class TradingCycleService:
                 f"Drawdown: {decision.drawdown_pct * Decimal('100'):.2f}%"
             ),
         )
+        await get_webhook_notifier().send_critical_alert(
+            "Global stop-loss triggered",
+            (
+                f"Symbol: {self.symbol}\n"
+                f"Reason: {decision.reason}\n"
+                f"Current equity: {decision.current_equity}\n"
+                f"Peak equity: {decision.peak_equity}"
+            ),
+        )
 
         if self.stop_loss_guard.config.auto_close_positions and position.quantity > 0:
             return await self._execute_paper_trade(
@@ -494,7 +681,6 @@ class TradingCycleService:
             session=session,
             position=position,
             mark_price=mark_price,
-            realized_delta=Decimal("0"),
         )
         return self._build_hold_result(
             symbol=self.symbol,
@@ -534,6 +720,15 @@ class TradingCycleService:
                     f"Action: auto recenter engaged"
                 ),
             )
+        await get_webhook_notifier().send_critical_alert(
+            "Grid out-of-bounds",
+            (
+                f"Symbol: {self.symbol}\n"
+                f"Price: {mark_price}\n"
+                f"Grid lower: {lower}\n"
+                f"Grid upper: {upper}"
+            ),
+        )
         await log_event(
             session,
             event_type="grid_out_of_bounds_alert",
@@ -559,24 +754,32 @@ class TradingCycleService:
         signal_reason: str,
         risk_action: str,
         risk_reason: str,
+        signal_indicators: dict[str, float] | None = None,
+        candle_low: Decimal | None = None,
+        candle_high: Decimal | None = None,
     ) -> CycleResult:
-        fill = self.paper_engine.execute_market_order(
-            OrderRequest(symbol=self.symbol, side=trade_side, quantity=quantity, order_type="MARKET"),
-            last_price=mark_price,
+        fill, order_type = self._execute_preferred_fill(
+            trade_side=trade_side,
+            quantity=quantity,
+            mark_price=mark_price,
+            signal_indicators=signal_indicators,
+            candle_low=candle_low,
+            candle_high=candle_high,
         )
+        config_version = await resolve_active_config_version(session)
         order = Order(
             client_order_id=f"paper_{uuid4().hex[:20]}",
             exchange_order_id=None,
             symbol=self.symbol,
             side=trade_side,
-            order_type="MARKET",
+            order_type=order_type,
             quantity=fill.filled_quantity,
             price=fill.price,
-            status="FILLED",
+            status=fill.status,
             is_paper=True,
             strategy_name=self.strategy.name,
             signal_reason=signal_reason,
-            config_version=1,
+            config_version=config_version,
         )
         session.add(order)
         await session.flush()
@@ -591,13 +794,12 @@ class TradingCycleService:
             slippage_bps=float(fill.slippage_bps),
         )
         session.add(fill_model)
-        realized_change = self._apply_fill_to_position(position, fill)
+        self._apply_fill_to_position(position, fill)
         session.add(position)
         await self._persist_cycle_snapshot(
             session=session,
             position=position,
             mark_price=(fill.price or mark_price),
-            realized_delta=realized_change,
         )
         await log_event(
             session,
@@ -610,7 +812,9 @@ class TradingCycleService:
                 "signal_reason": signal_reason,
                 "risk_reason": risk_reason,
                 "fee": str(fill.fee),
+                "order_type": order_type,
             },
+            config_version=config_version,
         )
         return CycleResult(
             symbol=self.symbol,
@@ -625,21 +829,69 @@ class TradingCycleService:
             price=str(fill.price) if fill.price else None,
         )
 
+    def _execute_preferred_fill(
+        self,
+        *,
+        trade_side: Literal["BUY", "SELL"],
+        quantity: Decimal,
+        mark_price: Decimal,
+        signal_indicators: dict[str, float] | None,
+        candle_low: Decimal | None,
+        candle_high: Decimal | None,
+    ) -> tuple[PaperFill, Literal["LIMIT", "MARKET"]]:
+        """Prefer maker-like limit fills for smart-grid, fallback to market fill."""
+        if (
+            self.strategy.name == "smart_grid_ai"
+            and signal_indicators is not None
+            and candle_low is not None
+            and candle_high is not None
+        ):
+            trigger_key = "buy_trigger" if trade_side == "BUY" else "sell_trigger"
+            trigger_raw = signal_indicators.get(trigger_key)
+            if isinstance(trigger_raw, int | float):
+                limit_price = Decimal(str(trigger_raw))
+                try:
+                    limit_fill = self.paper_engine.execute_limit_order(
+                        OrderRequest(
+                            symbol=self.symbol,
+                            side=trade_side,
+                            quantity=quantity,
+                            order_type="LIMIT",
+                            limit_price=limit_price,
+                        ),
+                        candle_low=candle_low,
+                        candle_high=candle_high,
+                    )
+                    if limit_fill.status in {"FILLED", "PARTIALLY_FILLED"} and limit_fill.filled_quantity > 0:
+                        return limit_fill, "LIMIT"
+                except PaperExecutionError:
+                    # Keep cycle alive with market fallback when limit validation fails.
+                    pass
+
+        market_fill = self.paper_engine.execute_market_order(
+            OrderRequest(symbol=self.symbol, side=trade_side, quantity=quantity, order_type="MARKET"),
+            last_price=mark_price,
+        )
+        return market_fill, "MARKET"
+
     async def _maybe_bootstrap_inventory(
         self,
         session: AsyncSession,
         position: Position,
         mark_price: Decimal,
+        signal_side: str,
         signal_reason: str,
     ) -> CycleResult | None:
-        if self.strategy.name != "smart_grid_ai":
-            return None
-        if not self.settings.trading.grid_auto_inventory_bootstrap:
-            return None
-        if signal_reason not in {"grid_sell_rebalance", "grid_take_profit_buffer_hit"}:
+        if not await self._is_bootstrap_candidate(
+            session=session,
+            signal_side=signal_side,
+            signal_reason=signal_reason,
+            current_quantity=Decimal(str(position.quantity)),
+        ):
             return None
         equity = await self._get_current_equity(session)
         current_exposure = position.quantity * mark_price
+        daily_realized = await self._compute_daily_realized_pnl(session)
         decision = self.risk_engine.evaluate(
             signal=Signal(
                 side="BUY",
@@ -649,7 +901,7 @@ class TradingCycleService:
             ),
             risk_input=RiskInput(
                 equity=equity,
-                daily_realized_pnl=Decimal("0"),
+                daily_realized_pnl=daily_realized,
                 current_exposure_notional=current_exposure,
                 price=mark_price,
             ),
@@ -657,11 +909,22 @@ class TradingCycleService:
         if not decision.allowed:
             return None
         fraction = Decimal(str(self.settings.trading.grid_bootstrap_fraction))
-        quantity = (decision.quantity * fraction).quantize(
-            self.risk_engine.config.lot_step_size,
-            rounding=ROUND_DOWN,
+        lot_step = self.risk_engine.config.lot_step_size
+        min_notional_qty = (self.risk_engine.config.min_notional / mark_price).quantize(
+            lot_step,
+            rounding=ROUND_UP,
+        )
+        quantity = max(
+            (decision.quantity * fraction).quantize(
+                lot_step,
+                rounding=ROUND_DOWN,
+            ),
+            min_notional_qty,
         )
         if quantity <= 0:
+            return None
+        notional = quantity * mark_price
+        if notional < self.risk_engine.config.min_notional:
             return None
         await log_event(
             session,
@@ -672,18 +935,71 @@ class TradingCycleService:
                 "reason": "initial_inventory_for_sell_grid_levels",
                 "risk_reason": decision.reason,
                 "fraction": str(fraction),
+                "trigger_signal_side": signal_side,
+                "trigger_signal_reason": signal_reason,
+                "notional": str(notional),
             },
         )
-        return await self._execute_paper_trade(
-            session=session,
-            position=position,
-            trade_side="BUY",
-            quantity=quantity,
-            mark_price=mark_price,
-            signal_reason="grid_inventory_bootstrap",
-            risk_action="ALLOW",
-            risk_reason="grid_inventory_bootstrap",
+        try:
+            return await self._execute_paper_trade(
+                session=session,
+                position=position,
+                trade_side="BUY",
+                quantity=quantity,
+                mark_price=mark_price,
+                signal_reason="grid_inventory_bootstrap",
+                risk_action="ALLOW",
+                risk_reason="grid_inventory_bootstrap",
+            )
+        except PaperExecutionError as exc:
+            await log_event(
+                session,
+                event_type="grid_inventory_bootstrap_skipped",
+                event_category="risk",
+                summary=f"Bootstrap skipped: {exc}",
+                details={
+                    "symbol": self.symbol,
+                    "quantity": str(quantity),
+                    "mark_price": str(mark_price),
+                    "min_notional": str(self.risk_engine.config.min_notional),
+                },
+            )
+            return None
+
+    async def _is_bootstrap_candidate(
+        self,
+        *,
+        session: AsyncSession,
+        signal_side: str,
+        signal_reason: str,
+        current_quantity: Decimal,
+    ) -> bool:
+        if self.strategy.name != "smart_grid_ai":
+            return False
+        if not self.settings.trading.grid_auto_inventory_bootstrap:
+            return False
+        if current_quantity > 0:
+            return False
+
+        if signal_side == "SELL" and signal_reason in {"grid_sell_rebalance", "grid_take_profit_buffer_hit"}:
+            return True
+
+        # Initial paper bootstrapping: if the strategy starts inside-band with no
+        # inventory and no prior fills, seed a tiny position so the first SELL legs
+        # can execute and operators can observe normal grid behavior.
+        if signal_side == "HOLD" and signal_reason in {"grid_wait_inside_band", "grid_recentered_auto"}:
+            return not await self._has_paper_fills(session)
+
+        return False
+
+    async def _has_paper_fills(self, session: AsyncSession) -> bool:
+        result = await session.execute(
+            select(Fill.id)
+            .join(Order, Fill.order_id == Order.id)
+            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .limit(1)
         )
+        return result.scalar_one_or_none() is not None
 
     async def _load_strategy_context(self, session: AsyncSession) -> StrategyContext | None:
         repo = CandleRepository(session)
@@ -783,14 +1099,65 @@ class TradingCycleService:
             unrealized = (mark_price - avg_entry) * quantity
         return self.starting_equity + realized + unrealized
 
-    async def _get_peak_equity(self, session: AsyncSession) -> Decimal:
+    async def _resolve_paper_equity_scope(
+        self,
+        session: AsyncSession,
+    ) -> tuple[Decimal | None, int | None]:
+        """Resolve global peak and optional scope anchor for mixed-baseline paper history."""
         result = await session.execute(
-            select(func.max(EquitySnapshot.equity)).where(EquitySnapshot.is_paper.is_(True))
+            select(EquitySnapshot.id, EquitySnapshot.equity)
+            .where(EquitySnapshot.is_paper.is_(True))
+            .order_by(EquitySnapshot.equity.desc(), EquitySnapshot.id.desc())
+            .limit(1)
         )
-        peak = result.scalar_one_or_none()
-        if peak is None:
+        row = result.first()
+        if row is None:
+            return None, None
+
+        peak_snapshot_id = int(row[0])
+        global_peak = Decimal(str(row[1]))
+        if self.starting_equity <= 0:
+            return global_peak, None
+
+        legacy_peak_ratio_threshold = Decimal("4")
+        if global_peak <= self.starting_equity * legacy_peak_ratio_threshold:
+            return global_peak, None
+
+        baseline_band_lower = self.starting_equity * Decimal("0.5")
+        baseline_band_upper = self.starting_equity * Decimal("1.5")
+        anchor_result = await session.execute(
+            select(EquitySnapshot.id)
+            .where(
+                EquitySnapshot.is_paper.is_(True),
+                EquitySnapshot.id > peak_snapshot_id,
+                EquitySnapshot.equity >= baseline_band_lower,
+                EquitySnapshot.equity <= baseline_band_upper,
+            )
+            .order_by(EquitySnapshot.id.asc())
+            .limit(1)
+        )
+        anchor_snapshot_id = anchor_result.scalar_one_or_none()
+        if anchor_snapshot_id is None:
+            return global_peak, None
+        return global_peak, int(anchor_snapshot_id)
+
+    async def _get_peak_equity(self, session: AsyncSession) -> Decimal:
+        global_peak, anchor_snapshot_id = await self._resolve_paper_equity_scope(session)
+        if global_peak is None:
             return self.starting_equity
-        return max(self.starting_equity, Decimal(str(peak)))
+        if anchor_snapshot_id is None:
+            return max(self.starting_equity, global_peak)
+
+        scoped_peak_result = await session.execute(
+            select(func.max(EquitySnapshot.equity)).where(
+                EquitySnapshot.is_paper.is_(True),
+                EquitySnapshot.id >= anchor_snapshot_id,
+            )
+        )
+        scoped_peak = scoped_peak_result.scalar_one_or_none()
+        if scoped_peak is None:
+            return self.starting_equity
+        return max(self.starting_equity, Decimal(str(scoped_peak)))
 
     async def _cooldown_remaining_seconds(self, session: AsyncSession) -> int:
         if self.grid_cooldown_seconds <= 0:
@@ -811,12 +1178,43 @@ class TradingCycleService:
         remaining = self.grid_cooldown_seconds - int(elapsed_seconds)
         return max(0, remaining)
 
+    async def _resolve_mark_price(
+        self,
+        session: AsyncSession,
+        *,
+        fallback_price: Decimal = Decimal("0"),
+    ) -> Decimal:
+        repo = CandleRepository(session)
+        checked_timeframes: list[str] = []
+        for timeframe in [self.timing_timeframe, self.regime_timeframe, *self.settings.trading.timeframe_list]:
+            if timeframe in checked_timeframes:
+                continue
+            checked_timeframes.append(timeframe)
+            price = await repo.get_latest_close_price(self.symbol, timeframe)
+            if price is not None and price > 0:
+                return price
+
+        if fallback_price > 0:
+            return fallback_price
+
+        result = await session.execute(
+            select(Fill.price)
+            .join(Order, Fill.order_id == Order.id)
+            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .order_by(Fill.filled_at.desc())
+            .limit(1)
+        )
+        last_fill_price = result.scalar_one_or_none()
+        if last_fill_price is not None:
+            return Decimal(str(last_fill_price))
+
+        raise RuntimeError(f"No mark price available to close position for {self.symbol}")
+
     async def _persist_cycle_snapshot(
         self,
         session: AsyncSession,
         position: Position,
         mark_price: Decimal,
-        realized_delta: Decimal,
     ) -> None:
         """Persist equity and metrics snapshot for every analyzed cycle."""
         equity_value = self.starting_equity + position.realized_pnl + position.unrealized_pnl
@@ -830,7 +1228,8 @@ class TradingCycleService:
                 is_paper=True,
             )
         )
-        metrics = await self._build_metrics_snapshot(session, realized_delta)
+        await session.flush()
+        metrics = await self._build_metrics_snapshot(session)
         session.add(metrics)
 
     def _apply_fill_to_position(self, position: Position, fill: PaperFill) -> Decimal:
@@ -869,16 +1268,96 @@ class TradingCycleService:
         position.realized_pnl = Decimal(str(position.realized_pnl)) + realized_delta
         return realized_delta
 
+    async def _compute_daily_realized_pnl(self, session: AsyncSession) -> Decimal:
+        """Compute realized PnL since UTC day start from fill history."""
+        day_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        fills_result = await session.execute(
+            select(Fill.filled_at, Fill.quantity, Fill.price, Fill.fee, Order.side)
+            .join(Order, Fill.order_id == Order.id)
+            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .order_by(Fill.filled_at.asc(), Fill.id.asc())
+        )
+        running_qty = Decimal("0")
+        avg_entry = Decimal("0")
+        daily_realized = Decimal("0")
+        for filled_at_raw, quantity_raw, price_raw, fee_raw, side_raw in fills_result.all():
+            filled_at = self._to_utc_datetime(filled_at_raw)
+            side = str(side_raw).upper()
+            quantity = Decimal(str(quantity_raw))
+            price = Decimal(str(price_raw))
+            fee = Decimal(str(fee_raw))
+            if side == "BUY":
+                new_qty = running_qty + quantity
+                if new_qty > 0:
+                    avg_entry = ((running_qty * avg_entry) + (quantity * price)) / new_qty
+                running_qty = new_qty
+                continue
+
+            sell_qty = min(quantity, running_qty)
+            realized_delta = ((price - avg_entry) * sell_qty) - fee
+            if filled_at >= day_start:
+                daily_realized += realized_delta
+            running_qty = running_qty - sell_qty
+            if running_qty <= 0:
+                running_qty = Decimal("0")
+                avg_entry = Decimal("0")
+        return daily_realized
+
+    async def _load_closed_trade_pnls(self, session: AsyncSession) -> list[float]:
+        """Reconstruct realized PnL values from BUY/SELL fill history."""
+        fills_result = await session.execute(
+            select(Fill.quantity, Fill.price, Fill.fee, Order.side)
+            .join(Order, Fill.order_id == Order.id)
+            .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            .order_by(Fill.filled_at.asc(), Fill.id.asc())
+        )
+        running_qty = Decimal("0")
+        avg_entry = Decimal("0")
+        closed_trade_pnls: list[float] = []
+        for quantity_raw, price_raw, fee_raw, side_raw in fills_result.all():
+            side = str(side_raw).upper()
+            quantity = Decimal(str(quantity_raw))
+            price = Decimal(str(price_raw))
+            fee = Decimal(str(fee_raw))
+            if side == "BUY":
+                new_qty = running_qty + quantity
+                if new_qty > 0:
+                    avg_entry = ((running_qty * avg_entry) + (quantity * price)) / new_qty
+                running_qty = new_qty
+                continue
+
+            sell_qty = min(quantity, running_qty)
+            realized_delta = ((price - avg_entry) * sell_qty) - fee
+            closed_trade_pnls.append(float(realized_delta))
+            running_qty = running_qty - sell_qty
+            if running_qty <= 0:
+                running_qty = Decimal("0")
+                avg_entry = Decimal("0")
+        return closed_trade_pnls
+
+    @staticmethod
+    def _to_utc_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
+
     async def _build_metrics_snapshot(
         self,
         session: AsyncSession,
-        realized_delta: Decimal,
     ) -> MetricsSnapshot:
         total_trades = (
-            await session.execute(select(func.count(Fill.id)).where(Fill.is_paper.is_(True)))
+            await session.execute(
+                select(func.count(Fill.id))
+                .join(Order, Fill.order_id == Order.id)
+                .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            )
         ).scalar_one()
         total_fees = (
-            await session.execute(select(func.coalesce(func.sum(Fill.fee), 0)).where(Fill.is_paper.is_(True)))
+            await session.execute(
+                select(func.coalesce(func.sum(Fill.fee), 0))
+                .join(Order, Fill.order_id == Order.id)
+                .where(Fill.is_paper.is_(True), Order.symbol == self.symbol)
+            )
         ).scalar_one()
         position_result = await session.execute(
             select(Position).where(Position.symbol == self.symbol, Position.is_paper.is_(True))
@@ -887,21 +1366,44 @@ class TradingCycleService:
         total_pnl = Decimal("0")
         if position is not None:
             total_pnl = Decimal(str(position.realized_pnl)) + Decimal(str(position.unrealized_pnl))
+        _, anchor_snapshot_id = await self._resolve_paper_equity_scope(session)
+        equity_query = select(EquitySnapshot.equity).where(EquitySnapshot.is_paper.is_(True))
+        if anchor_snapshot_id is not None:
+            equity_query = equity_query.where(EquitySnapshot.id >= anchor_snapshot_id)
+        equity_query = equity_query.order_by(EquitySnapshot.snapshot_at.asc(), EquitySnapshot.id.asc())
+        equity_result = await session.execute(equity_query)
+        equity_curve = [float(Decimal(str(value))) for value in equity_result.scalars().all()]
+        if not equity_curve:
+            equity_curve = [float(self.starting_equity)]
 
-        previous_metrics_result = await session.execute(
-            select(MetricsSnapshot)
-            .where(MetricsSnapshot.is_paper.is_(True), MetricsSnapshot.strategy_name == self.strategy.name)
-            .order_by(MetricsSnapshot.snapshot_at.desc())
-            .limit(1)
+        closed_trade_pnls = await self._load_closed_trade_pnls(session)
+        winning_trades = sum(1 for pnl in closed_trade_pnls if pnl > 0)
+        losing_trades = sum(1 for pnl in closed_trade_pnls if pnl < 0)
+        closed_trade_count = len(closed_trade_pnls)
+
+        exposure_notional = Decimal("0")
+        if position is not None:
+            position_qty = Decimal(str(position.quantity))
+            avg_entry = Decimal(str(position.avg_entry_price))
+            if position_qty > 0 and avg_entry > 0:
+                exposure_notional = position_qty * avg_entry
+        latest_equity = Decimal(str(equity_curve[-1])) if equity_curve else self.starting_equity
+        exposures_pct: list[float] = []
+        if latest_equity > 0:
+            exposures_pct.append(float((exposure_notional / latest_equity) * Decimal("100")))
+
+        calculator = MetricsCalculator()
+        computed = calculator.calculate(
+            trade_pnls=closed_trade_pnls,
+            equity_curve=equity_curve,
+            fees_paid=float(Decimal(str(total_fees))),
+            exposures_pct=exposures_pct,
         )
-        previous_metrics = previous_metrics_result.scalar_one_or_none()
-        previous_wins = previous_metrics.winning_trades if previous_metrics else 0
-        previous_losses = previous_metrics.losing_trades if previous_metrics else 0
-        winning_trades = previous_wins + (1 if realized_delta > 0 else 0)
-        losing_trades = previous_losses + (1 if realized_delta < 0 else 0)
-        win_rate = None
-        if total_trades > 0:
-            win_rate = winning_trades / total_trades
+        win_rate = (winning_trades / closed_trade_count) if closed_trade_count > 0 else None
+        avg_trade_pnl = None
+        if closed_trade_count > 0:
+            closed_total = sum(Decimal(str(pnl)) for pnl in closed_trade_pnls)
+            avg_trade_pnl = closed_total / Decimal(closed_trade_count)
 
         return MetricsSnapshot(
             strategy_name=self.strategy.name,
@@ -910,12 +1412,12 @@ class TradingCycleService:
             losing_trades=losing_trades,
             total_pnl=total_pnl,
             total_fees=Decimal(str(total_fees)),
-            max_drawdown=0.0,
-            sharpe_ratio=None,
-            sortino_ratio=None,
-            profit_factor=None,
+            max_drawdown=float(computed.max_drawdown),
+            sharpe_ratio=computed.sharpe_ratio,
+            sortino_ratio=computed.sortino_ratio,
+            profit_factor=computed.profit_factor if closed_trade_count > 0 else None,
             win_rate=win_rate,
-            avg_trade_pnl=(total_pnl / total_trades) if total_trades > 0 else None,
+            avg_trade_pnl=avg_trade_pnl,
             is_paper=True,
         )
 
@@ -931,3 +1433,10 @@ def get_trading_cycle_service() -> TradingCycleService:
             if _trading_cycle_service is None:
                 _trading_cycle_service = TradingCycleService()
     return _trading_cycle_service
+
+
+def reset_trading_cycle_service() -> None:
+    """Reset singleton so next access reloads runtime settings/strategy."""
+    global _trading_cycle_service
+    with _trading_cycle_service_lock:
+        _trading_cycle_service = None

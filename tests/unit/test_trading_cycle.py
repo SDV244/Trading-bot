@@ -171,6 +171,53 @@ async def test_hold_cycle_persists_equity_and_metrics_snapshots(db_session: Asyn
 
 
 @pytest.mark.asyncio
+async def test_close_open_paper_position_executes_force_sell(db_session: AsyncSession) -> None:
+    await _seed_candles(db_session, "1h", 120, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 120, Decimal("45000"), Decimal("50"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "BuyStrategy",
+        (),
+        {
+            "name": "buy_test",
+            "generate_signal": staticmethod(
+                lambda _context: Signal(side="BUY", confidence=0.9, reason="force_buy", indicators={})
+            ),
+        },
+    )()
+    first = await service.run_once(db_session)
+    assert first.executed is True
+
+    closed = await service.close_open_paper_position(
+        db_session,
+        reason="test_close_all",
+        actor="test",
+    )
+    assert closed.executed is True
+    assert closed.signal_side == "SELL"
+    assert closed.risk_action == "FORCE_CLOSE"
+    assert closed.risk_reason == "test_close_all"
+
+    position_result = await db_session.execute(select(Position).where(Position.symbol == "BTCUSDT"))
+    position = position_result.scalar_one()
+    assert Decimal(str(position.quantity)) == Decimal("0")
+
+
+@pytest.mark.asyncio
+async def test_close_open_paper_position_noop_when_flat(db_session: AsyncSession) -> None:
+    service = TradingCycleService()
+    result = await service.close_open_paper_position(
+        db_session,
+        reason="test_close_all",
+        actor="test",
+    )
+    assert result.executed is False
+    assert result.risk_reason == "no_inventory_to_sell"
+
+
+@pytest.mark.asyncio
 async def test_global_stop_loss_triggers_emergency_stop(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -202,6 +249,81 @@ async def test_global_stop_loss_triggers_emergency_stop(
     assert result.executed is False
     assert result.risk_reason == "stop_loss_global_equity_triggered"
     assert state_module.get_state_manager().state.value == "emergency_stop"
+
+
+@pytest.mark.asyncio
+async def test_global_stop_loss_ignores_legacy_peak_from_previous_paper_baseline(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_STOP_LOSS_ENABLED", "true")
+    monkeypatch.setenv("TRADING_STOP_LOSS_MAX_DRAWDOWN_PCT", "0.20")
+    monkeypatch.setenv("TRADING_PAPER_STARTING_EQUITY", "1000")
+    monkeypatch.setenv("TRADING_SPOT_POSITION_MODE", "incremental")
+    reload_settings()
+
+    await _seed_candles(db_session, "1h", 120, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 120, Decimal("45000"), Decimal("50"))
+
+    # Legacy snapshots from an older run with higher baseline.
+    db_session.add_all(
+        [
+            EquitySnapshot(
+                equity=Decimal("9996.87543657"),
+                available_balance=Decimal("9996.87543657"),
+                unrealized_pnl=Decimal("0"),
+                is_paper=True,
+            ),
+            EquitySnapshot(
+                equity=Decimal("9990.00000000"),
+                available_balance=Decimal("9990.00000000"),
+                unrealized_pnl=Decimal("0"),
+                is_paper=True,
+            ),
+            # New baseline campaign around 1,000 USDT should anchor peak scope.
+            EquitySnapshot(
+                equity=Decimal("1000.00000000"),
+                available_balance=Decimal("1000.00000000"),
+                unrealized_pnl=Decimal("0"),
+                is_paper=True,
+            ),
+        ]
+    )
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            side=None,
+            quantity=Decimal("0"),
+            avg_entry_price=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            realized_pnl=Decimal("-3.12456343"),
+            total_fees=Decimal("0"),
+            is_paper=True,
+        )
+    )
+    await db_session.flush()
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "HoldStrategy",
+        (),
+        {
+            "name": "hold_test",
+            "generate_signal": staticmethod(
+                lambda _context: Signal(side="HOLD", confidence=0.0, reason="hold_test", indicators={})
+            ),
+        },
+    )()
+
+    result = await service.run_once(db_session)
+    assert result.risk_reason != "stop_loss_drawdown_triggered"
+    assert state_module.get_state_manager().state.value == "running"
+    metrics_result = await db_session.execute(
+        select(MetricsSnapshot).where(MetricsSnapshot.is_paper.is_(True)).order_by(MetricsSnapshot.id.desc()).limit(1)
+    )
+    latest_metrics = metrics_result.scalar_one()
+    assert latest_metrics.max_drawdown < 0.2
 
 
 @pytest.mark.asyncio
@@ -268,6 +390,134 @@ async def test_smart_grid_does_not_bootstrap_on_recenter_breakdown_sell(
     assert result.executed is False
     assert result.signal_side == "SELL"
     assert result.risk_reason == "no_inventory_to_sell"
+
+
+@pytest.mark.asyncio
+async def test_smart_grid_bootstraps_inventory_on_hold_when_initially_flat(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+    monkeypatch.setenv("TRADING_GRID_AUTO_INVENTORY_BOOTSTRAP", "true")
+    reload_settings()
+    await _seed_candles(db_session, "1h", 140, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 80, Decimal("45000"), Decimal("50"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "HoldGridStrategy",
+        (),
+        {
+            "name": "smart_grid_ai",
+            "generate_signal": staticmethod(
+                lambda _context: Signal(side="HOLD", confidence=0.4, reason="grid_wait_inside_band", indicators={})
+            ),
+        },
+    )()
+
+    result = await service.run_once(db_session)
+    assert result.executed is True
+    assert result.signal_side == "BUY"
+    assert result.signal_reason == "grid_inventory_bootstrap"
+    assert result.risk_reason == "grid_inventory_bootstrap"
+
+
+@pytest.mark.asyncio
+async def test_smart_grid_does_not_bootstrap_on_hold_after_trade_history_exists(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+    monkeypatch.setenv("TRADING_GRID_AUTO_INVENTORY_BOOTSTRAP", "true")
+    reload_settings()
+    await _seed_candles(db_session, "1h", 140, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 80, Decimal("45000"), Decimal("50"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    order = Order(
+        client_order_id="paper_history_seed",
+        exchange_order_id=None,
+        symbol="BTCUSDT",
+        side="BUY",
+        order_type="MARKET",
+        quantity=Decimal("0.001"),
+        price=Decimal("50000"),
+        status="FILLED",
+        is_paper=True,
+        strategy_name="smart_grid_ai",
+        signal_reason="history_seed",
+        config_version=1,
+    )
+    db_session.add(order)
+    await db_session.flush()
+    db_session.add(
+        Fill(
+            order_id=order.id,
+            fill_id="paper_history_seed_fill",
+            quantity=Decimal("0.001"),
+            price=Decimal("50000"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            is_paper=True,
+            slippage_bps=0.0,
+        )
+    )
+    await db_session.flush()
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "HoldGridStrategy",
+        (),
+        {
+            "name": "smart_grid_ai",
+            "generate_signal": staticmethod(
+                lambda _context: Signal(side="HOLD", confidence=0.4, reason="grid_wait_inside_band", indicators={})
+            ),
+        },
+    )()
+
+    result = await service.run_once(db_session)
+    assert result.executed is False
+    assert result.signal_side == "HOLD"
+    assert result.risk_reason == "signal_hold"
+
+
+@pytest.mark.asyncio
+async def test_smart_grid_bootstrap_respects_min_notional_with_fraction(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+    monkeypatch.setenv("TRADING_GRID_AUTO_INVENTORY_BOOTSTRAP", "true")
+    monkeypatch.setenv("TRADING_GRID_BOOTSTRAP_FRACTION", "0.6")
+    monkeypatch.setenv("TRADING_PAPER_STARTING_EQUITY", "1000")
+    monkeypatch.setenv("RISK_PER_TRADE", "0.015")
+    reload_settings()
+    await _seed_candles(db_session, "1h", 140, Decimal("70000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 80, Decimal("65000"), Decimal("30"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "HoldGridStrategy",
+        (),
+        {
+            "name": "smart_grid_ai",
+            "generate_signal": staticmethod(
+                lambda _context: Signal(side="HOLD", confidence=0.4, reason="grid_recentered_auto", indicators={})
+            ),
+        },
+    )()
+
+    result = await service.run_once(db_session)
+    assert result.executed is True
+    assert result.signal_side == "BUY"
+    assert result.signal_reason == "grid_inventory_bootstrap"
+
+    fill_result = await db_session.execute(select(Fill).order_by(Fill.id.desc()).limit(1))
+    fill = fill_result.scalar_one()
+    assert Decimal(str(fill.quantity)) * Decimal(str(fill.price)) >= Decimal("10")
 
 
 @pytest.mark.asyncio
@@ -473,3 +723,131 @@ def test_paper_starting_equity_comes_from_settings(monkeypatch: pytest.MonkeyPat
     reload_settings()
     service = TradingCycleService()
     assert service.starting_equity == Decimal("7500")
+
+
+@pytest.mark.asyncio
+async def test_daily_realized_pnl_blocks_when_max_daily_loss_exceeded(
+    db_session: AsyncSession,
+) -> None:
+    await _seed_candles(db_session, "1h", 120, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 120, Decimal("45000"), Decimal("50"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    yesterday = datetime.now(UTC) - timedelta(days=1)
+    today = datetime.now(UTC) - timedelta(minutes=1)
+
+    buy_order = Order(
+        client_order_id="seed_buy_daily_loss",
+        exchange_order_id=None,
+        symbol="BTCUSDT",
+        side="BUY",
+        order_type="MARKET",
+        quantity=Decimal("0.10000000"),
+        price=Decimal("50000"),
+        status="FILLED",
+        is_paper=True,
+        strategy_name="seed",
+        signal_reason="seed",
+        config_version=1,
+    )
+    db_session.add(buy_order)
+    await db_session.flush()
+    db_session.add(
+        Fill(
+            order_id=buy_order.id,
+            fill_id="seed_fill_buy_daily_loss",
+            quantity=Decimal("0.10000000"),
+            price=Decimal("50000"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            is_paper=True,
+            slippage_bps=0.0,
+            filled_at=yesterday,
+        )
+    )
+
+    sell_order = Order(
+        client_order_id="seed_sell_daily_loss",
+        exchange_order_id=None,
+        symbol="BTCUSDT",
+        side="SELL",
+        order_type="MARKET",
+        quantity=Decimal("0.10000000"),
+        price=Decimal("47000"),
+        status="FILLED",
+        is_paper=True,
+        strategy_name="seed",
+        signal_reason="seed",
+        config_version=1,
+    )
+    db_session.add(sell_order)
+    await db_session.flush()
+    db_session.add(
+        Fill(
+            order_id=sell_order.id,
+            fill_id="seed_fill_sell_daily_loss",
+            quantity=Decimal("0.10000000"),
+            price=Decimal("47000"),
+            fee=Decimal("0"),
+            fee_asset="USDT",
+            is_paper=True,
+            slippage_bps=0.0,
+            filled_at=today,
+        )
+    )
+    await db_session.flush()
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "BuyStrategy",
+        (),
+        {
+            "name": "buy_test",
+            "generate_signal": staticmethod(
+                lambda _context: Signal(side="BUY", confidence=0.9, reason="force_buy", indicators={})
+            ),
+        },
+    )()
+
+    result = await service.run_once(db_session)
+    assert result.executed is False
+    assert result.risk_reason == "max_daily_loss_exceeded"
+
+
+@pytest.mark.asyncio
+async def test_smart_grid_prefers_limit_order_fill_when_trigger_is_touched(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+    reload_settings()
+    await _seed_candles(db_session, "1h", 140, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 80, Decimal("45000"), Decimal("50"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "SmartGridBuyStrategy",
+        (),
+        {
+            "name": "smart_grid_ai",
+            "generate_signal": staticmethod(
+                lambda context: Signal(
+                    side="BUY",
+                    confidence=0.8,
+                    reason="grid_buy_rebalance",
+                    indicators={
+                        "buy_trigger": float(context.candles_1h[-1].close),
+                        "sell_trigger": float(context.candles_1h[-1].close + Decimal("100")),
+                    },
+                )
+            ),
+        },
+    )()
+
+    result = await service.run_once(db_session)
+    assert result.executed is True
+
+    order_result = await db_session.execute(select(Order).order_by(Order.id.desc()).limit(1))
+    order = order_result.scalar_one()
+    assert order.order_type == "LIMIT"

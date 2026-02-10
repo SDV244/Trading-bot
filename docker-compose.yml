@@ -14,12 +14,31 @@ services:
       TRADING_REQUIRE_DATA_READY: "true"
       TRADING_SPOT_POSITION_MODE: ${TRADING_SPOT_POSITION_MODE:-long_flat}
       TRADING_PAPER_STARTING_EQUITY: ${TRADING_PAPER_STARTING_EQUITY:-10000}
+      TELEGRAM_HEARTBEAT_ENABLED: ${TELEGRAM_HEARTBEAT_ENABLED:-true}
+      TELEGRAM_HEARTBEAT_HOURS: ${TELEGRAM_HEARTBEAT_HOURS:-4}
+      TELEGRAM_SUMMARIES_ENABLED: ${TELEGRAM_SUMMARIES_ENABLED:-true}
+      TELEGRAM_SUMMARY_HOURS: ${TELEGRAM_SUMMARY_HOURS:-6}
+      TELEGRAM_DAILY_WRAP_ENABLED: ${TELEGRAM_DAILY_WRAP_ENABLED:-true}
+      API_RATE_LIMIT_ENABLED: ${API_RATE_LIMIT_ENABLED:-true}
+      API_RATE_LIMIT_REQUESTS_PER_MINUTE: ${API_RATE_LIMIT_REQUESTS_PER_MINUTE:-600}
+      API_RATE_LIMIT_AUTH_REQUESTS_PER_MINUTE: ${API_RATE_LIMIT_AUTH_REQUESTS_PER_MINUTE:-60}
       APP_SECRETS_DIR: /run/secrets/trading-bot
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
       - ./.secrets:/run/secrets/trading-bot:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').getcode()==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     restart: unless-stopped
 
   web:
@@ -29,5 +48,17 @@ services:
     ports:
       - "5173:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1/ >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
     restart: unless-stopped

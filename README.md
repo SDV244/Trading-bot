@@ -74,6 +74,7 @@ Production-oriented local trading platform with strict safety controls:
 - AI proposals are never auto-applied without approval
 - Approval expiry triggers emergency stop
 - Every significant action writes an audit event
+- Optional external LLM advisor (OpenAI/Anthropic/Gemini/Ollama) with strict diff filtering
 
 ## Quick Start
 
@@ -108,6 +109,12 @@ Set required values in `.env`:
 - optional tuned profile: `TRADING_ACTIVE_STRATEGY=trend_ema_fast`
 - use `APP_SECRETS_DIR` for credentials (file-per-secret)
 - `BINANCE_API_KEY` and `BINANCE_API_SECRET` are only required for live/signed flows
+- optional LLM advisor:
+  - `LLM_ENABLED=true`
+  - `LLM_PROVIDER=openai|anthropic|gemini|ollama`
+  - `LLM_MODEL=<provider-model>`
+  - `LLM_API_KEY=<secret>` (not required for local Ollama)
+  - optional `LLM_BASE_URL` for self-hosted or gateway routing
 - optional Telegram:
   - `TELEGRAM_BOT_TOKEN`
   - `TELEGRAM_CHAT_ID`
@@ -187,6 +194,8 @@ Trading:
 AI approvals:
 
 - `POST /api/ai/proposals/generate`
+- `GET /api/ai/llm/status`
+- `POST /api/ai/llm/test`
 - `GET /api/ai/approvals`
 - `POST /api/ai/approvals/{id}/approve`
 - `POST /api/ai/approvals/{id}/reject`

@@ -52,6 +52,23 @@ def test_hold_when_max_exposure_reached() -> None:
     assert decision.reason == "max_exposure_reached"
 
 
+def test_sell_not_blocked_by_max_exposure_limit() -> None:
+    engine = RiskEngine(RiskConfig(max_exposure=Decimal("0.25")))
+    decision = engine.evaluate(
+        Signal(side="SELL", confidence=0.9, reason="test", indicators={}),
+        RiskInput(
+            equity=Decimal("10000"),
+            daily_realized_pnl=Decimal("0"),
+            current_exposure_notional=Decimal("2500"),
+            price=Decimal("50000"),
+        ),
+    )
+    assert decision.action == "ALLOW"
+    assert decision.allowed is True
+    assert decision.reason == "risk_checks_passed"
+    assert decision.quantity > 0
+
+
 def test_allow_valid_signal_and_compute_size() -> None:
     engine = RiskEngine(
         RiskConfig(

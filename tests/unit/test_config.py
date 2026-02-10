@@ -69,6 +69,12 @@ class TestSettings:
         assert settings.risk.per_trade == 0.005
         assert settings.risk.max_daily_loss == 0.02
         assert settings.approval.timeout_hours == 2
+        assert settings.approval.auto_approve_enabled is False
+        assert settings.llm.enabled is False
+        assert settings.llm.provider == "openai"
+        assert settings.llm.model == "gpt-4.1-mini"
+        assert settings.llm.prefer_llm is True
+        assert settings.llm.fallback_to_rules is True
 
     def test_timeframes_parsing(self, monkeypatch):
         """Timeframes string is parsed correctly."""
@@ -191,3 +197,62 @@ class TestSettings:
         assert settings.trading.stop_loss_max_drawdown_pct == 0.18
         assert settings.trading.stop_loss_auto_close_positions is False
         assert settings.trading.advisor_interval_cycles == 15
+
+    def test_apply_runtime_config_patch_updates_known_keys(self, monkeypatch):
+        """Runtime config patch mutates in-memory settings sections safely."""
+        monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "trend_ema")
+        monkeypatch.setenv("RISK_PER_TRADE", "0.005")
+
+        import packages.core.config as config_module
+
+        config_module._settings = None
+        settings = config_module.get_settings()
+        assert settings.trading.active_strategy == "trend_ema"
+        assert settings.risk.per_trade == 0.005
+
+        applied = config_module.apply_runtime_config_patch(
+            {
+                "trading": {"active_strategy": "trend_ema_fast"},
+                "risk": {"per_trade": 0.0035},
+                "unknown_section": {"ignored": True},
+            }
+        )
+        assert applied["trading"] == ["active_strategy"]
+        assert applied["risk"] == ["per_trade"]
+        assert config_module.get_settings().trading.active_strategy == "trend_ema_fast"
+        assert config_module.get_settings().risk.per_trade == 0.0035
+
+    def test_approval_auto_approve_override(self, monkeypatch):
+        """Approval auto-approve can be overridden from env."""
+        monkeypatch.setenv("APPROVAL_AUTO_APPROVE_ENABLED", "true")
+
+        import packages.core.config as config_module
+
+        config_module._settings = None
+        settings = config_module.get_settings()
+        assert settings.approval.auto_approve_enabled is True
+        config_module.reload_settings()
+
+    def test_llm_settings_override(self, monkeypatch):
+        """LLM provider settings can be overridden from env."""
+        monkeypatch.setenv("LLM_ENABLED", "true")
+        monkeypatch.setenv("LLM_PROVIDER", "ollama")
+        monkeypatch.setenv("LLM_MODEL", "llama3.1:8b")
+        monkeypatch.setenv("LLM_BASE_URL", "http://127.0.0.1:11434/api/chat")
+        monkeypatch.setenv("LLM_MAX_PROPOSALS", "5")
+        monkeypatch.setenv("LLM_MIN_CONFIDENCE", "0.65")
+        monkeypatch.setenv("LLM_PREFER_LLM", "true")
+        monkeypatch.setenv("LLM_FALLBACK_TO_RULES", "false")
+
+        import packages.core.config as config_module
+
+        config_module._settings = None
+        settings = config_module.get_settings()
+        assert settings.llm.enabled is True
+        assert settings.llm.provider == "ollama"
+        assert settings.llm.model == "llama3.1:8b"
+        assert settings.llm.base_url == "http://127.0.0.1:11434/api/chat"
+        assert settings.llm.max_proposals == 5
+        assert settings.llm.min_confidence == 0.65
+        assert settings.llm.prefer_llm is True
+        assert settings.llm.fallback_to_rules is False

@@ -5,6 +5,7 @@ Endpoints for managing system state (running, paused, emergency stop).
 """
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,9 +13,11 @@ from pydantic import BaseModel, Field
 
 from apps.api.security.auth import AuthUser, require_min_role
 from packages.adapters.telegram_bot import get_telegram_notifier
+from packages.adapters.webhook_notifier import get_webhook_notifier
 from packages.core.audit import log_event
-from packages.core.config import AuthRole, get_settings
+from packages.core.config import AuthRole, get_settings, reload_settings
 from packages.core.database.session import get_session, init_database
+from packages.core.observability import increment_system_state
 from packages.core.scheduler import get_trading_scheduler
 from packages.core.state import get_state_manager
 from packages.core.trading_cycle import DataReadiness, get_trading_cycle_service
@@ -101,6 +104,53 @@ class NotificationTestResponse(BaseModel):
     message: str
 
 
+class CircuitBreakerStatusItem(BaseModel):
+    """Circuit breaker diagnostic snapshot."""
+
+    name: str
+    available: bool
+    details: dict[str, Any] | None = None
+    reason: str | None = None
+
+
+class CircuitBreakerStatusResponse(BaseModel):
+    """All circuit breaker statuses."""
+
+    breakers: dict[str, CircuitBreakerStatusItem]
+
+
+class CircuitBreakerResetResponse(BaseModel):
+    """Circuit breaker reset result."""
+
+    name: str
+    reset: bool
+    details: dict[str, Any]
+
+
+class ReloadConfigResponse(BaseModel):
+    """Runtime config reload result."""
+
+    reloaded: bool
+    live_mode: bool
+    active_strategy: str
+    require_data_ready: bool
+    min_cycle_interval_seconds: int
+    message: str
+
+
+class ReconciliationResponse(BaseModel):
+    """Balance reconciliation response."""
+
+    mode: str
+    db_equity: str
+    exchange_equity: str | None
+    difference: str
+    within_warning_tolerance: bool
+    within_critical_tolerance: bool
+    reason: str
+    emergency_stop_triggered: bool
+
+
 def _serialize_readiness(readiness: DataReadiness) -> dict[str, TimeframeReadinessResponse]:
     return {
         timeframe: TimeframeReadinessResponse(
@@ -174,7 +224,12 @@ async def change_state(
             },
             actor=actor,
         )
+    increment_system_state(current.state.value)
     await get_telegram_notifier().send_info(
+        "System state changed",
+        f"State: {current.state.value}\nReason: {current.reason}\nBy: {current.changed_by}",
+    )
+    await get_webhook_notifier().send_info(
         "System state changed",
         f"State: {current.state.value}\nReason: {current.reason}\nBy: {current.changed_by}",
     )
@@ -212,7 +267,12 @@ async def emergency_stop(
             },
             actor=actor,
         )
+    increment_system_state(current.state.value)
     await get_telegram_notifier().send_critical_alert(
+        "Emergency stop triggered",
+        f"Reason: {request.reason}\nBy: {actor}",
+    )
+    await get_webhook_notifier().send_critical_alert(
         "Emergency stop triggered",
         f"Reason: {request.reason}\nBy: {actor}",
     )
@@ -346,6 +406,175 @@ async def stop_scheduler(
         last_run_at=status.last_run_at,
         last_error=status.last_error,
         last_result=status.last_result,
+    )
+
+
+@router.get("/circuit-breakers/status", response_model=CircuitBreakerStatusResponse)
+async def get_circuit_breakers_status(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> CircuitBreakerStatusResponse:
+    """Get adapter circuit-breaker states."""
+    from packages.adapters.binance_live import get_binance_live_adapter
+    from packages.adapters.binance_spot import get_binance_adapter
+
+    settings = get_settings()
+    spot_stats = get_binance_adapter().get_circuit_breaker_stats()
+    breakers: dict[str, CircuitBreakerStatusItem] = {
+        "binance_spot": CircuitBreakerStatusItem(
+            name="binance_spot",
+            available=True,
+            details=spot_stats,
+            reason=None,
+        )
+    }
+
+    has_live_credentials = bool(settings.binance.api_key and settings.binance.api_secret)
+    if has_live_credentials:
+        try:
+            live_stats = get_binance_live_adapter().get_circuit_breaker_stats()
+            breakers["binance_live"] = CircuitBreakerStatusItem(
+                name="binance_live",
+                available=True,
+                details=live_stats,
+                reason=None,
+            )
+        except Exception as e:
+            breakers["binance_live"] = CircuitBreakerStatusItem(
+                name="binance_live",
+                available=False,
+                details=None,
+                reason=str(e),
+            )
+    else:
+        breakers["binance_live"] = CircuitBreakerStatusItem(
+            name="binance_live",
+            available=False,
+            details=None,
+            reason="BINANCE_API_KEY/BINANCE_API_SECRET are not configured",
+        )
+
+    return CircuitBreakerStatusResponse(breakers=breakers)
+
+
+@router.post("/circuit-breakers/{breaker_name}/reset", response_model=CircuitBreakerResetResponse)
+async def reset_circuit_breaker(
+    breaker_name: str,
+    user: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> CircuitBreakerResetResponse:
+    """Reset one circuit breaker to CLOSED state."""
+    from packages.adapters.binance_live import get_binance_live_adapter
+    from packages.adapters.binance_spot import get_binance_adapter
+
+    await init_database()
+    settings = get_settings()
+    normalized = breaker_name.strip().lower()
+
+    if normalized == "binance_spot":
+        spot_adapter = get_binance_adapter()
+        await spot_adapter.reset_circuit_breaker()
+        details = spot_adapter.get_circuit_breaker_stats()
+    elif normalized == "binance_live":
+        if not settings.binance.api_key or not settings.binance.api_secret:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot reset binance_live breaker without BINANCE_API_KEY/BINANCE_API_SECRET",
+            )
+        live_adapter = get_binance_live_adapter()
+        await live_adapter.reset_circuit_breaker()
+        details = live_adapter.get_circuit_breaker_stats()
+    else:
+        raise HTTPException(status_code=404, detail=f"Unknown breaker: {breaker_name}")
+
+    async with get_session() as session:
+        await log_event(
+            session,
+            event_type="circuit_breaker_reset",
+            event_category="system",
+            summary=f"Circuit breaker reset: {normalized}",
+            details={"breaker": normalized, "state": details.get("state")},
+            actor=user.username,
+        )
+
+    return CircuitBreakerResetResponse(name=normalized, reset=True, details=details)
+
+
+@router.post("/config/reload", response_model=ReloadConfigResponse)
+async def reload_runtime_config(
+    user: AuthUser = Depends(require_min_role(AuthRole.ADMIN)),
+) -> ReloadConfigResponse:
+    """Reload environment configuration with safe guards."""
+    from packages.core.trading_cycle import reset_trading_cycle_service
+
+    previous = get_settings()
+    previous_live_mode = previous.trading.live_mode
+    previous_active_strategy = previous.trading.active_strategy
+
+    reloaded = reload_settings()
+    if reloaded.trading.live_mode != previous_live_mode:
+        # Revert disallowed runtime live-mode toggle.
+        previous.trading.live_mode = previous_live_mode
+        reloaded.trading.live_mode = previous_live_mode
+        message = "Reloaded with safeguard: runtime live_mode changes require restart"
+    else:
+        message = "Configuration reloaded"
+
+    reset_trading_cycle_service()
+
+    await init_database()
+    async with get_session() as session:
+        await log_event(
+            session,
+            event_type="config_reloaded",
+            event_category="config",
+            summary="Runtime configuration reloaded",
+            details={
+                "previous_active_strategy": previous_active_strategy,
+                "active_strategy": reloaded.trading.active_strategy,
+                "live_mode": reloaded.trading.live_mode,
+                "require_data_ready": reloaded.trading.require_data_ready,
+                "min_cycle_interval_seconds": reloaded.trading.min_cycle_interval_seconds,
+            },
+            actor=user.username,
+        )
+
+    return ReloadConfigResponse(
+        reloaded=True,
+        live_mode=reloaded.trading.live_mode,
+        active_strategy=reloaded.trading.active_strategy,
+        require_data_ready=reloaded.trading.require_data_ready,
+        min_cycle_interval_seconds=reloaded.trading.min_cycle_interval_seconds,
+        message=message,
+    )
+
+
+@router.get("/reconciliation", response_model=ReconciliationResponse)
+async def run_balance_reconciliation(
+    warning_tolerance: float = Query(default=1.0, ge=0),
+    critical_tolerance: float = Query(default=100.0, ge=0),
+    user: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> ReconciliationResponse:
+    """Run one balance reconciliation check (paper/live)."""
+    from packages.core.reconciliation import run_reconciliation_guard
+
+    await init_database()
+    async with get_session() as session:
+        outcome = await run_reconciliation_guard(
+            session,
+            warning_tolerance=Decimal(str(warning_tolerance)),
+            critical_tolerance=Decimal(str(critical_tolerance)),
+            actor=user.username,
+        )
+    result = outcome.result
+
+    return ReconciliationResponse(
+        mode=result.mode,
+        db_equity=str(result.db_equity),
+        exchange_equity=str(result.exchange_equity) if result.exchange_equity is not None else None,
+        difference=str(result.difference),
+        within_warning_tolerance=result.within_warning_tolerance,
+        within_critical_tolerance=result.within_critical_tolerance,
+        reason=result.reason,
+        emergency_stop_triggered=outcome.emergency_stop_triggered,
     )
 
 

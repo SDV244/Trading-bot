@@ -37,6 +37,12 @@ Example response:
 }
 ```
 
+Prometheus metrics:
+
+```bash
+curl -s http://127.0.0.1:8000/metrics
+```
+
 ## 2) Login (when `AUTH_ENABLED=true`)
 
 ```bash
@@ -165,11 +171,54 @@ curl -s -X POST http://127.0.0.1:8000/api/system/notifications/test \
   -d '{"title":"Trading Bot test notification","body":"Connectivity check"}'
 ```
 
+Circuit breaker status:
+
+```bash
+curl -s http://127.0.0.1:8000/api/system/circuit-breakers/status \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Reset spot circuit breaker:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/system/circuit-breakers/binance_spot/reset \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Reload runtime configuration (admin):
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/system/config/reload \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Run balance reconciliation:
+
+```bash
+curl -s "http://127.0.0.1:8000/api/system/reconciliation?warning_tolerance=1&critical_tolerance=100" \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Readiness status (returns `503` if dependencies are down):
+
+```bash
+curl -i -s http://127.0.0.1:8000/ready
+```
+
 ## 7) Run One Paper Cycle
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/api/trading/paper/cycle \
   -H "Authorization: Bearer $TOKEN"
+```
+
+Force-close open paper inventory:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/trading/paper/close-all-positions \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"reason":"manual_close_all_positions"}'
 ```
 
 ## 8) Trading Data
@@ -189,6 +238,9 @@ Important fields in this response include:
 - `spot_position_mode`
 - `paper_starting_equity`
 - `advisor_interval_cycles`
+- `min_cycle_interval_seconds`
+- `reconciliation_interval_cycles`
+- `reconciliation_warning_tolerance`, `reconciliation_critical_tolerance`
 - `grid_lookback_1h`, `grid_atr_period_1h`, `grid_levels`
 - `grid_min_spacing_bps`, `grid_max_spacing_bps`
 - `grid_trend_tilt`, `grid_volatility_blend`
@@ -234,6 +286,20 @@ Generate proposals:
 
 ```bash
 curl -s -X POST http://127.0.0.1:8000/api/ai/proposals/generate \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+LLM advisor status:
+
+```bash
+curl -s http://127.0.0.1:8000/api/ai/llm/status \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+LLM provider connectivity test:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/ai/llm/test \
   -H "Authorization: Bearer $TOKEN"
 ```
 
@@ -322,6 +388,29 @@ curl -s -X POST http://127.0.0.1:8000/api/trading/live/order \
     "ui_confirmed":true,
     "reauthenticated":true,
     "safety_acknowledged":true,
+    "idempotency_key":"manual-live-buy-2026-02-10-001",
     "reason":"manual controlled test"
   }'
 ```
+
+If the request is retried with the same `idempotency_key`, the API returns the original confirmed result instead of sending a duplicate order.
+
+## 13) Rate Limit Behavior
+
+When limits are exceeded, API returns `429`:
+
+```json
+{
+  "detail": "Rate limit exceeded",
+  "category": "api",
+  "limit_per_minute": 600,
+  "retry_after_seconds": 12
+}
+```
+
+Rate-limit headers:
+
+- `Retry-After`
+- `X-RateLimit-Limit`
+- `X-RateLimit-Remaining`
+- `X-RateLimit-Window`

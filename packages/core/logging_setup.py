@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from contextvars import ContextVar
 from pathlib import Path
@@ -66,5 +67,26 @@ def configure_logging() -> None:
 
 def _patch_record(record: dict[str, Any]) -> None:
     record["extra"]["request_id"] = request_id_var.get()
-    if isinstance(record["message"], dict):
-        record["message"] = json.dumps(record["message"])
+    for key, value in list(record["extra"].items()):
+        if key == "request_id":
+            continue
+        record["extra"][key] = _sanitize_log_value(value)
+    record["message"] = _sanitize_log_value(record["message"])
+
+
+def _sanitize_log_value(value: Any) -> str:
+    if isinstance(value, dict):
+        return json.dumps({str(key): _sanitize_log_value(raw) for key, raw in value.items()})
+    if isinstance(value, list):
+        return json.dumps([_sanitize_log_value(item) for item in value])
+    text = str(value)
+    patterns = [
+        (r"signature=[^&\\s]+", "signature=REDACTED"),
+        (r"X-MBX-APIKEY=[^&\\s]+", "X-MBX-APIKEY=REDACTED"),
+        (r"api[_-]?key\"?\s*[:=]\s*\"?[A-Za-z0-9_\-]+", "api_key=REDACTED"),
+        (r"api[_-]?secret\"?\s*[:=]\s*\"?[A-Za-z0-9_\-]+", "api_secret=REDACTED"),
+        (r"token\"?\s*[:=]\s*\"?[A-Za-z0-9_\-:.]+", "token=REDACTED"),
+    ]
+    for pattern, replacement in patterns:
+        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+    return text

@@ -66,7 +66,10 @@ Rules:
 
 ## 5) AI Proposal + Approval Flow
 
-1. Advisor (`packages/core/ai/advisor.py`) generates proposals from current data/metrics.
+1. Advisor (`packages/core/ai/advisor.py`) builds context from current data/metrics and, when enabled,
+   asks the configured LLM provider (`openai|anthropic|gemini|ollama`) for proposals.
+   - LLM output is schema-filtered and key-whitelisted before entering approvals.
+   - if configured fallback is enabled, built-in rule proposals are used when LLM output is empty/invalid.
    - for `smart_grid_ai`, advisor can emit grid-specific tuning proposals
      (`grid_levels`, spacing bounds, volatility blend) based on win-rate/drawdown.
 2. Proposal is saved as `PENDING` in `approvals`.

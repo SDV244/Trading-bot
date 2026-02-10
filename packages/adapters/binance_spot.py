@@ -326,6 +326,14 @@ class BinanceSpotAdapter:
 
         raise ValueError(f"Symbol {symbol} not found")
 
+    def get_circuit_breaker_stats(self) -> dict[str, Any]:
+        """Expose current circuit-breaker state for diagnostics."""
+        return self._circuit_breaker.get_stats()
+
+    async def reset_circuit_breaker(self) -> None:
+        """Reset circuit-breaker state to CLOSED."""
+        await self._circuit_breaker.reset()
+
 
 # Singleton instance
 _adapter: BinanceSpotAdapter | None = None

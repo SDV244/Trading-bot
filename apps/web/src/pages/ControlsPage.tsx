@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
 
-import { api, type NotificationStatus } from "../api";
+import { api, type NotificationStatus, type ReconciliationResponse } from "../api";
 import { hasMinRole, useAuth } from "../auth";
+import { formatNumber } from "../utils";
 import { useDashboard } from "../dashboard";
 
 export function ControlsPage() {
@@ -12,7 +13,11 @@ export function ControlsPage() {
   const [notificationStatus, setNotificationStatus] = useState<NotificationStatus | null>(null);
   const [notificationHint, setNotificationHint] = useState<string | null>(null);
   const [recenterMode, setRecenterMode] = useState<"conservative" | "aggressive">("aggressive");
+  const [manualReconciliation, setManualReconciliation] = useState<ReconciliationResponse | null>(null);
   const recenterApplicable = data.config?.active_strategy === "smart_grid_ai";
+  const isEmergencyStop = data.system?.state === "emergency_stop";
+  const canReleaseEmergencyStop = hasMinRole(user?.role, "admin");
+  const schedulerReconciliation = data.scheduler?.last_result?.reconciliation ?? null;
 
   async function refreshNotificationStatus() {
     try {
@@ -76,8 +81,23 @@ export function ControlsPage() {
           ? "Bot token + chat id detected."
           : "Configure secrets and click Refresh Notification Status.",
       },
+      {
+        label: "Reconciliation status",
+        ready: Boolean(schedulerReconciliation?.within_critical_tolerance ?? true),
+        detail: schedulerReconciliation
+          ? `Mode=${schedulerReconciliation.mode}, diff=${schedulerReconciliation.difference}`
+          : "No scheduler reconciliation snapshot yet.",
+      },
     ],
-    [data.scheduler?.running, data.system?.reason, data.system?.state, data.systemReadiness?.data_ready, data.systemReadiness?.reasons, notificationStatus?.enabled],
+    [
+      data.scheduler?.running,
+      data.system?.reason,
+      data.system?.state,
+      data.systemReadiness?.data_ready,
+      data.systemReadiness?.reasons,
+      notificationStatus?.enabled,
+      schedulerReconciliation,
+    ],
   );
 
   return (
@@ -103,6 +123,11 @@ export function ControlsPage() {
         {data.systemReadiness && !data.systemReadiness.data_ready && data.systemReadiness.require_data_ready ? (
           <p className="mt-3 text-xs text-amber-200">
             Scheduler warmup blocked: {data.systemReadiness.reasons.join(" | ")}
+          </p>
+        ) : null}
+        {isEmergencyStop ? (
+          <p className="mt-3 rounded-lg border border-rose-400/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-100">
+            System is in EMERGENCY_STOP. Release it to PAUSED first, then use Resume Trading.
           </p>
         ) : null}
         <div className="mt-4 grid gap-2">
@@ -138,13 +163,38 @@ export function ControlsPage() {
             </div>
           </div>
           <button
-            className="rounded-lg border border-mint/50 bg-mint/15 px-3 py-2 text-left text-xs text-mint hover:bg-mint/20"
+            className={`rounded-lg border px-3 py-2 text-left text-xs ${
+              canReleaseEmergencyStop && isEmergencyStop
+                ? "border-rose-300/60 bg-rose-500/20 text-rose-100 hover:bg-rose-500/30"
+                : "border-slate-400/30 bg-slate-500/10 text-slate-400"
+            }`}
+            disabled={!canReleaseEmergencyStop || !isEmergencyStop}
+            onClick={() =>
+              void runAction("Releasing emergency stop to PAUSED...", () =>
+                api.setSystemState("manual_resume", "dashboard_manual_resume").then(() => undefined),
+              )
+            }
+          >
+            Release Emergency Stop (Admin)
+          </button>
+          <button
+            className={`rounded-lg border px-3 py-2 text-left text-xs ${
+              isEmergencyStop
+                ? "border-slate-400/30 bg-slate-500/10 text-slate-400"
+                : "border-mint/50 bg-mint/15 text-mint hover:bg-mint/20"
+            }`}
+            disabled={isEmergencyStop}
             onClick={() => void runAction("Resuming system...", () => api.setSystemState("resume", "dashboard_resume").then(() => undefined))}
           >
             Resume Trading
           </button>
           <button
-            className="rounded-lg border border-amber-400/50 bg-amber-400/10 px-3 py-2 text-left text-xs text-amber-200 hover:bg-amber-400/20"
+            className={`rounded-lg border px-3 py-2 text-left text-xs ${
+              isEmergencyStop
+                ? "border-slate-400/30 bg-slate-500/10 text-slate-400"
+                : "border-amber-400/50 bg-amber-400/10 text-amber-200 hover:bg-amber-400/20"
+            }`}
+            disabled={isEmergencyStop}
             onClick={() => void runAction("Pausing system...", () => api.setSystemState("pause", "dashboard_pause").then(() => undefined))}
           >
             Pause Trading
@@ -164,6 +214,33 @@ export function ControlsPage() {
             onClick={() => void runAction("Running one paper cycle...", runPaperCycle)}
           >
             Run One Paper Cycle
+          </button>
+          <button
+            className="rounded-lg border border-orange-300/60 bg-orange-500/10 px-3 py-2 text-left text-xs text-orange-200 hover:bg-orange-500/20"
+            onClick={() =>
+              void runAction("Closing open paper position...", async () => {
+                const confirmed = window.confirm(
+                  "Force-close any open paper position now? This executes an immediate SELL in paper mode.",
+                );
+                if (!confirmed) {
+                  return;
+                }
+                await api.closeAllPaperPositions("manual_operator_close_all_positions");
+              })
+            }
+          >
+            Close Open Paper Position
+          </button>
+          <button
+            className="rounded-lg border border-teal-300/60 bg-teal-500/10 px-3 py-2 text-left text-xs text-teal-100 hover:bg-teal-500/20"
+            onClick={() =>
+              void runAction("Running reconciliation check...", async () => {
+                const result = await api.runReconciliation();
+                setManualReconciliation(result);
+              })
+            }
+          >
+            Run Reconciliation Check
           </button>
           {data.scheduler?.running ? (
             <button
@@ -240,6 +317,29 @@ export function ControlsPage() {
           <p>Token Present: {String(notificationStatus?.has_bot_token ?? false)}</p>
           <p>Chat ID Present: {String(notificationStatus?.has_chat_id ?? false)}</p>
           <p className="mt-1 text-slate-300">{notificationHint ?? "-"}</p>
+          <div className="mt-3 border-t border-white/10 pt-3">
+            <p>Scheduler Reconciliation: {schedulerReconciliation ? "available" : "not yet"}</p>
+            <p>
+              Last Diff:{" "}
+              {schedulerReconciliation ? formatNumber(schedulerReconciliation.difference, 4) : "-"}
+            </p>
+            <p>
+              Within Critical Tolerance:{" "}
+              {schedulerReconciliation
+                ? String(schedulerReconciliation.within_critical_tolerance)
+                : "-"}
+            </p>
+            <p>
+              Manual Reconciliation Diff:{" "}
+              {manualReconciliation ? formatNumber(manualReconciliation.difference, 4) : "-"}
+            </p>
+            <p>
+              Manual Reconciliation Critical:{" "}
+              {manualReconciliation
+                ? String(manualReconciliation.within_critical_tolerance)
+                : "-"}
+            </p>
+          </div>
         </div>
       </article>
     </section>
