@@ -4,6 +4,7 @@ Database Connection and Session Management
 Async SQLAlchemy engine and session factory for SQLite.
 """
 
+import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -22,21 +23,24 @@ from packages.core.database.models import Base
 # Engine instance (lazy initialization)
 _engine = None
 _session_factory = None
+_session_init_lock = threading.RLock()
 
 
 def get_engine() -> AsyncEngine:
     """Get or create the async engine."""
     global _engine
     if _engine is None:
-        settings = get_settings()
-        url = make_url(settings.database.url)
-        if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
-            Path(url.database).parent.mkdir(parents=True, exist_ok=True)
-        _engine = create_async_engine(
-            settings.database.url,
-            echo=settings.log.level == "DEBUG",
-            future=True,
-        )
+        with _session_init_lock:
+            if _engine is None:
+                settings = get_settings()
+                url = make_url(settings.database.url)
+                if url.get_backend_name() == "sqlite" and url.database and url.database != ":memory:":
+                    Path(url.database).parent.mkdir(parents=True, exist_ok=True)
+                _engine = create_async_engine(
+                    settings.database.url,
+                    echo=settings.log.level == "DEBUG",
+                    future=True,
+                )
     return _engine
 
 
@@ -44,12 +48,14 @@ def get_session_factory() -> async_sessionmaker[AsyncSession]:
     """Get or create the session factory."""
     global _session_factory
     if _session_factory is None:
-        _session_factory = async_sessionmaker(
-            bind=get_engine(),
-            class_=AsyncSession,
-            expire_on_commit=False,
-            autoflush=False,
-        )
+        with _session_init_lock:
+            if _session_factory is None:
+                _session_factory = async_sessionmaker(
+                    bind=get_engine(),
+                    class_=AsyncSession,
+                    expire_on_commit=False,
+                    autoflush=False,
+                )
     return _session_factory
 
 

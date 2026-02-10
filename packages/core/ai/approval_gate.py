@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -241,11 +242,14 @@ def _to_utc(value: datetime) -> datetime:
 
 
 _approval_gate: ApprovalGate | None = None
+_approval_gate_lock = threading.Lock()
 
 
 def get_approval_gate() -> ApprovalGate:
     """Get or create singleton approval gate."""
     global _approval_gate
     if _approval_gate is None:
-        _approval_gate = ApprovalGate()
+        with _approval_gate_lock:
+            if _approval_gate is None:
+                _approval_gate = ApprovalGate()
     return _approval_gate

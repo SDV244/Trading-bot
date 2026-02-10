@@ -11,6 +11,8 @@ export function ControlsPage() {
   const [error, setError] = useState<string | null>(null);
   const [notificationStatus, setNotificationStatus] = useState<NotificationStatus | null>(null);
   const [notificationHint, setNotificationHint] = useState<string | null>(null);
+  const [recenterMode, setRecenterMode] = useState<"conservative" | "aggressive">("aggressive");
+  const recenterApplicable = data.config?.active_strategy === "smart_grid_ai";
 
   async function refreshNotificationStatus() {
     try {
@@ -29,6 +31,12 @@ export function ControlsPage() {
   useEffect(() => {
     void refreshNotificationStatus();
   }, []);
+
+  useEffect(() => {
+    if (data.config?.grid_recenter_mode) {
+      setRecenterMode(data.config.grid_recenter_mode);
+    }
+  }, [data.config?.grid_recenter_mode]);
 
   async function runAction(label: string, action: () => Promise<void>) {
     try {
@@ -98,6 +106,37 @@ export function ControlsPage() {
           </p>
         ) : null}
         <div className="mt-4 grid gap-2">
+          <div className="rounded-lg border border-white/10 bg-black/10 p-3">
+            <p className="text-xs text-slate-100">Smart Grid Recenter Mode</p>
+            <p className="mt-1 text-xs text-slate-300">
+              Conservative waits after recenter. Aggressive can act on breakout/breakdown after recenter.
+            </p>
+            {!recenterApplicable ? (
+              <p className="mt-1 text-xs text-amber-200">
+                Active strategy is {data.config?.active_strategy ?? "-"}; mode will apply once smart_grid_ai is active.
+              </p>
+            ) : null}
+            <div className="mt-2 flex items-center gap-2">
+              <select
+                className="rounded-md border border-white/20 bg-slate-900/80 px-2 py-1 text-xs text-slate-100"
+                value={recenterMode}
+                onChange={(event) => setRecenterMode(event.target.value as "conservative" | "aggressive")}
+              >
+                <option value="aggressive">Aggressive</option>
+                <option value="conservative">Conservative</option>
+              </select>
+              <button
+                className="rounded-md border border-cyan-300/60 bg-cyan-500/10 px-2 py-1 text-xs text-cyan-100 hover:bg-cyan-500/20"
+                onClick={() =>
+                  void runAction(`Applying recenter mode: ${recenterMode}`, async () => {
+                    await api.setGridRecenterMode(recenterMode, "dashboard_control");
+                  })
+                }
+              >
+                Apply Recenter Mode
+              </button>
+            </div>
+          </div>
           <button
             className="rounded-lg border border-mint/50 bg-mint/15 px-3 py-2 text-left text-xs text-mint hover:bg-mint/20"
             onClick={() => void runAction("Resuming system...", () => api.setSystemState("resume", "dashboard_resume").then(() => undefined))}

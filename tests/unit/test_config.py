@@ -59,6 +59,11 @@ class TestSettings:
         assert settings.trading.grid_enforce_fee_floor is False
         assert settings.trading.grid_min_net_profit_bps == 30
         assert settings.trading.grid_out_of_bounds_alert_cooldown_minutes == 60
+        assert settings.trading.grid_recenter_mode == "aggressive"
+        assert settings.trading.stop_loss_enabled is True
+        assert settings.trading.stop_loss_global_equity_pct == 0.15
+        assert settings.trading.stop_loss_max_drawdown_pct == 0.20
+        assert settings.trading.stop_loss_auto_close_positions is True
         assert settings.trading.advisor_interval_cycles == 30
         assert settings.trading.paper_starting_equity == 10000.0
         assert settings.risk.per_trade == 0.005
@@ -153,6 +158,11 @@ class TestSettings:
         monkeypatch.setenv("TRADING_GRID_ENFORCE_FEE_FLOOR", "true")
         monkeypatch.setenv("TRADING_GRID_MIN_NET_PROFIT_BPS", "40")
         monkeypatch.setenv("TRADING_GRID_OUT_OF_BOUNDS_ALERT_COOLDOWN_MINUTES", "30")
+        monkeypatch.setenv("TRADING_GRID_RECENTER_MODE", "conservative")
+        monkeypatch.setenv("TRADING_STOP_LOSS_ENABLED", "true")
+        monkeypatch.setenv("TRADING_STOP_LOSS_GLOBAL_EQUITY_PCT", "0.12")
+        monkeypatch.setenv("TRADING_STOP_LOSS_MAX_DRAWDOWN_PCT", "0.18")
+        monkeypatch.setenv("TRADING_STOP_LOSS_AUTO_CLOSE_POSITIONS", "false")
         monkeypatch.setenv("TRADING_ADVISOR_INTERVAL_CYCLES", "15")
 
         import packages.core.config as config_module
@@ -175,4 +185,9 @@ class TestSettings:
         assert settings.trading.grid_enforce_fee_floor is True
         assert settings.trading.grid_min_net_profit_bps == 40
         assert settings.trading.grid_out_of_bounds_alert_cooldown_minutes == 30
+        assert settings.trading.grid_recenter_mode == "conservative"
+        assert settings.trading.stop_loss_enabled is True
+        assert settings.trading.stop_loss_global_equity_pct == 0.12
+        assert settings.trading.stop_loss_max_drawdown_pct == 0.18
+        assert settings.trading.stop_loss_auto_close_positions is False
         assert settings.trading.advisor_interval_cycles == 15

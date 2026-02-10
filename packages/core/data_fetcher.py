@@ -6,6 +6,7 @@ Handles initial data loading and periodic updates.
 """
 
 import asyncio
+import threading
 from datetime import UTC, datetime, timedelta
 
 from loguru import logger
@@ -182,11 +183,14 @@ class DataFetcher:
 
 # Singleton instance
 _fetcher: DataFetcher | None = None
+_fetcher_lock = threading.Lock()
 
 
 def get_data_fetcher() -> DataFetcher:
     """Get or create the data fetcher singleton."""
     global _fetcher
     if _fetcher is None:
-        _fetcher = DataFetcher()
+        with _fetcher_lock:
+            if _fetcher is None:
+                _fetcher = DataFetcher()
     return _fetcher

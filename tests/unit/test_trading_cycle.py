@@ -171,6 +171,40 @@ async def test_hold_cycle_persists_equity_and_metrics_snapshots(db_session: Asyn
 
 
 @pytest.mark.asyncio
+async def test_global_stop_loss_triggers_emergency_stop(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_STOP_LOSS_ENABLED", "true")
+    monkeypatch.setenv("TRADING_STOP_LOSS_GLOBAL_EQUITY_PCT", "0.10")
+    monkeypatch.setenv("TRADING_STOP_LOSS_AUTO_CLOSE_POSITIONS", "false")
+    reload_settings()
+    await _seed_candles(db_session, "1h", 120, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 120, Decimal("45000"), Decimal("50"))
+    db_session.add(
+        Position(
+            symbol="BTCUSDT",
+            side=None,
+            quantity=Decimal("0"),
+            avg_entry_price=Decimal("0"),
+            unrealized_pnl=Decimal("0"),
+            realized_pnl=Decimal("-1500"),
+            total_fees=Decimal("0"),
+            is_paper=True,
+        )
+    )
+    await db_session.flush()
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    result = await service.run_once(db_session)
+
+    assert result.executed is False
+    assert result.risk_reason == "stop_loss_global_equity_triggered"
+    assert state_module.get_state_manager().state.value == "emergency_stop"
+
+
+@pytest.mark.asyncio
 async def test_smart_grid_bootstraps_inventory_on_sell_when_flat(
     db_session: AsyncSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -199,6 +233,41 @@ async def test_smart_grid_bootstraps_inventory_on_sell_when_flat(
     assert result.signal_side == "BUY"
     assert result.signal_reason == "grid_inventory_bootstrap"
     assert result.risk_reason == "grid_inventory_bootstrap"
+
+
+@pytest.mark.asyncio
+async def test_smart_grid_does_not_bootstrap_on_recenter_breakdown_sell(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+    monkeypatch.setenv("TRADING_GRID_AUTO_INVENTORY_BOOTSTRAP", "true")
+    reload_settings()
+    await _seed_candles(db_session, "1h", 140, Decimal("50000"), Decimal("10"))
+    await _seed_candles(db_session, "4h", 80, Decimal("45000"), Decimal("50"))
+    state_module.get_state_manager().resume("run cycle", "test")
+
+    service = TradingCycleService()
+    service.strategy = type(  # type: ignore[method-assign]
+        "BreakdownSellStrategy",
+        (),
+        {
+            "name": "smart_grid_ai",
+            "generate_signal": staticmethod(
+                lambda _context: Signal(
+                    side="SELL",
+                    confidence=0.8,
+                    reason="grid_recentered_auto_breakdown_sell",
+                    indicators={},
+                )
+            ),
+        },
+    )()
+
+    result = await service.run_once(db_session)
+    assert result.executed is False
+    assert result.signal_side == "SELL"
+    assert result.risk_reason == "no_inventory_to_sell"
 
 
 @pytest.mark.asyncio
@@ -288,7 +357,7 @@ async def test_out_of_bounds_emits_alert_once_within_cooldown(
         def __init__(self) -> None:
             self.calls = 0
 
-        async def send_critical_alert(self, title: str, body: str) -> bool:
+        async def send_critical_alert(self, _title: str, _body: str) -> bool:
             self.calls += 1
             return True
 
@@ -349,12 +418,26 @@ async def test_smart_grid_strategy_can_be_selected(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
     monkeypatch.setenv("TRADING_GRID_LOOKBACK_1H", "140")
     monkeypatch.setenv("TRADING_GRID_ATR_PERIOD_1H", "18")
+    monkeypatch.setenv("TRADING_GRID_RECENTER_MODE", "conservative")
     reload_settings()
     service = TradingCycleService()
 
     assert service.strategy.name == "smart_grid_ai"
+    assert service.strategy.recenter_mode == "conservative"
     assert service.get_strategy_requirements()["1h"] == 140
     assert service.get_strategy_requirements()["4h"] == 55
+
+
+def test_set_grid_recenter_mode_updates_active_smart_grid(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+    monkeypatch.setenv("TRADING_GRID_RECENTER_MODE", "aggressive")
+    reload_settings()
+    service = TradingCycleService()
+
+    mode = service.set_grid_recenter_mode("conservative")
+    assert mode == "conservative"
+    assert service.settings.trading.grid_recenter_mode == "conservative"
+    assert service.strategy.recenter_mode == "conservative"
 
 
 def test_paper_engine_symbol_allowlist_tracks_configured_pair(monkeypatch: pytest.MonkeyPatch) -> None:

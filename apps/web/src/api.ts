@@ -76,6 +76,12 @@ export type NotificationTestResponse = {
   message: string;
 };
 
+export type GridRecenterModeUpdateResponse = {
+  active_strategy: string;
+  mode: "conservative" | "aggressive";
+  applied_to_live_strategy: boolean;
+};
+
 export type Position = {
   symbol: string;
   side: string | null;
@@ -126,6 +132,11 @@ export type TradingConfig = {
   grid_enforce_fee_floor: boolean;
   grid_min_net_profit_bps: number;
   grid_out_of_bounds_alert_cooldown_minutes: number;
+  grid_recenter_mode: "conservative" | "aggressive";
+  stop_loss_enabled: boolean;
+  stop_loss_global_equity_pct: number;
+  stop_loss_max_drawdown_pct: number;
+  stop_loss_auto_close_positions: boolean;
   risk_per_trade: number;
   max_daily_loss: number;
   max_exposure: number;
@@ -342,6 +353,11 @@ export const api = {
       method: "POST",
     }),
   getTradingConfig: () => fetchJson<TradingConfig>("/api/trading/config"),
+  setGridRecenterMode: (mode: "conservative" | "aggressive", reason = "dashboard_grid_mode_update") =>
+    fetchJson<GridRecenterModeUpdateResponse>("/api/trading/config/recenter-mode", {
+      method: "POST",
+      body: JSON.stringify({ mode, reason, changed_by: "web_dashboard" }),
+    }),
   getPosition: () => fetchJson<Position>("/api/trading/position"),
   getMetrics: () => fetchJson<Metrics>("/api/trading/metrics"),
   getOrders: (limit = 10, status?: string) =>

@@ -1,6 +1,7 @@
 """Background scheduler for periodic paper trading cycles."""
 
 import asyncio
+import threading
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Any
@@ -165,13 +166,16 @@ class TradingScheduler:
 
 
 _trading_scheduler: TradingScheduler | None = None
+_trading_scheduler_lock = threading.Lock()
 
 
 def get_trading_scheduler() -> TradingScheduler:
     """Get or create trading scheduler singleton."""
     global _trading_scheduler
     if _trading_scheduler is None:
-        _trading_scheduler = TradingScheduler()
+        with _trading_scheduler_lock:
+            if _trading_scheduler is None:
+                _trading_scheduler = TradingScheduler()
     return _trading_scheduler
 
 

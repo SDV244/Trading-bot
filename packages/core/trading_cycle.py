@@ -1,5 +1,6 @@
 """Single-cycle paper trading orchestration."""
 
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal
@@ -23,6 +24,7 @@ from packages.core.database.models import (
 from packages.core.database.repositories import CandleRepository
 from packages.core.execution.paper_engine import OrderRequest, PaperEngine, PaperFill
 from packages.core.risk.engine import RiskConfig, RiskEngine, RiskInput
+from packages.core.risk.global_stop_loss import GlobalStopLossConfig, GlobalStopLossGuard
 from packages.core.state import get_state_manager
 from packages.core.strategies import Strategy, registry
 from packages.core.strategies.base import CandleInput, Signal, StrategyContext
@@ -92,6 +94,14 @@ class TradingCycleService:
             slippage_bps=settings.risk.slippage_bps,
             allowed_symbols={self.symbol},
         )
+        self.stop_loss_guard = GlobalStopLossGuard(
+            GlobalStopLossConfig(
+                enabled=settings.trading.stop_loss_enabled,
+                global_equity_pct=Decimal(str(settings.trading.stop_loss_global_equity_pct)),
+                max_drawdown_pct=Decimal(str(settings.trading.stop_loss_max_drawdown_pct)),
+                auto_close_positions=settings.trading.stop_loss_auto_close_positions,
+            )
+        )
         self.starting_equity = Decimal(str(settings.trading.paper_starting_equity))
         self.grid_cooldown_seconds = max(0, settings.trading.grid_cooldown_seconds)
         self._last_out_of_bounds_alert_at: datetime | None = None
@@ -111,11 +121,22 @@ class TradingCycleService:
                     volatility_blend=self.settings.trading.grid_volatility_blend,
                     take_profit_buffer=self.settings.trading.grid_take_profit_buffer,
                     stop_loss_buffer=self.settings.trading.grid_stop_loss_buffer,
+                    recenter_mode=self.settings.trading.grid_recenter_mode,
                 )
             return registry.create(strategy_name)
         except ValueError as exc:
             msg = f"Invalid TRADING_ACTIVE_STRATEGY '{strategy_name}': {exc}"
             raise ValueError(msg) from exc
+
+    def set_grid_recenter_mode(self, mode: str) -> str:
+        """Update smart-grid recenter mode at runtime for the active service."""
+        normalized = mode.strip().lower()
+        if normalized not in {"conservative", "aggressive"}:
+            raise ValueError("mode must be 'conservative' or 'aggressive'")
+        self.settings.trading.grid_recenter_mode = normalized
+        if self.strategy.name == "smart_grid_ai":
+            self.strategy.recenter_mode = normalized  # type: ignore[attr-defined]
+        return normalized
 
     def _normalize_requirements(self, raw: dict[str, int]) -> dict[str, int]:
         requirements: dict[str, int] = {}
@@ -166,12 +187,12 @@ class TradingCycleService:
             if min_net_bps < required_net_bps:
                 data_ready = False
                 reasons.append(
-                    (
+
                         "fee_floor_not_met: "
                         f"min_net_bps={min_net_bps}, required_net_bps={required_net_bps}, "
                         f"grid_min_spacing_bps={self.settings.trading.grid_min_spacing_bps}, "
                         f"round_trip_cost_bps={round_trip_cost_bps}"
-                    )
+
                 )
         return DataReadiness(
             symbol=self.symbol,
@@ -238,9 +259,17 @@ class TradingCycleService:
                 risk_reason="insufficient_candles",
             )
 
-        signal = self.strategy.generate_signal(context)
         last_price = context.candles_1h[-1].close
         position = await self._get_or_create_position(session)
+        stop_loss_result = await self._check_global_stop_loss(
+            session=session,
+            position=position,
+            mark_price=last_price,
+        )
+        if stop_loss_result is not None:
+            return stop_loss_result
+
+        signal = self.strategy.generate_signal(context)
         await self._maybe_alert_out_of_bounds(session, signal, last_price)
         if self.grid_cooldown_seconds > 0 and signal.side in {"BUY", "SELL"}:
             remaining_cooldown = await self._cooldown_remaining_seconds(session)
@@ -263,6 +292,7 @@ class TradingCycleService:
                 session=session,
                 position=position,
                 mark_price=last_price,
+                signal_reason=signal.reason,
             )
             if bootstrap is not None:
                 return bootstrap
@@ -385,6 +415,94 @@ class TradingCycleService:
             risk_reason=risk_decision.reason,
         )
 
+    async def _check_global_stop_loss(
+        self,
+        *,
+        session: AsyncSession,
+        position: Position,
+        mark_price: Decimal,
+    ) -> CycleResult | None:
+        if not self.stop_loss_guard.config.enabled:
+            return None
+        current_equity = self._compute_equity_from_position(position=position, mark_price=mark_price)
+        peak_equity = await self._get_peak_equity(session)
+        decision = self.stop_loss_guard.evaluate(
+            current_equity=current_equity,
+            starting_equity=self.starting_equity,
+            peak_equity=peak_equity,
+        )
+        if not decision.triggered:
+            return None
+        manager = get_state_manager()
+        manager.force_emergency_stop(
+            reason=decision.reason,
+            changed_by="global_stop_loss",
+            metadata={
+                "trigger_type": decision.trigger_type.value if decision.trigger_type else None,
+                "current_equity": str(decision.current_equity),
+                "starting_equity": str(decision.starting_equity),
+                "peak_equity": str(decision.peak_equity),
+                "loss_pct": str(decision.loss_pct),
+                "drawdown_pct": str(decision.drawdown_pct),
+            },
+        )
+        await log_event(
+            session,
+            event_type="global_stop_loss_triggered",
+            event_category="risk",
+            summary=(
+                f"Global stop-loss triggered ({decision.reason}) "
+                f"equity={decision.current_equity} peak={decision.peak_equity}"
+            ),
+            details={
+                "trigger_type": decision.trigger_type.value if decision.trigger_type else None,
+                "reason": decision.reason,
+                "current_equity": str(decision.current_equity),
+                "starting_equity": str(decision.starting_equity),
+                "peak_equity": str(decision.peak_equity),
+                "loss_pct": float(decision.loss_pct),
+                "drawdown_pct": float(decision.drawdown_pct),
+            },
+            actor="global_stop_loss",
+        )
+        notifier = get_telegram_notifier()
+        await notifier.send_critical_alert(
+            "Global stop-loss triggered",
+            (
+                f"Symbol: {self.symbol}\n"
+                f"Reason: {decision.reason}\n"
+                f"Current equity: {decision.current_equity}\n"
+                f"Peak equity: {decision.peak_equity}\n"
+                f"Loss: {decision.loss_pct * Decimal('100'):.2f}%\n"
+                f"Drawdown: {decision.drawdown_pct * Decimal('100'):.2f}%"
+            ),
+        )
+
+        if self.stop_loss_guard.config.auto_close_positions and position.quantity > 0:
+            return await self._execute_paper_trade(
+                session=session,
+                position=position,
+                trade_side="SELL",
+                quantity=Decimal(str(position.quantity)),
+                mark_price=mark_price,
+                signal_reason="global_stop_loss_forced_close",
+                risk_action="HOLD",
+                risk_reason=decision.reason,
+            )
+
+        await self._persist_cycle_snapshot(
+            session=session,
+            position=position,
+            mark_price=mark_price,
+            realized_delta=Decimal("0"),
+        )
+        return self._build_hold_result(
+            symbol=self.symbol,
+            signal_side="HOLD",
+            signal_reason="global_stop_loss_triggered",
+            risk_reason=decision.reason,
+        )
+
     async def _maybe_alert_out_of_bounds(
         self,
         session: AsyncSession,
@@ -393,7 +511,7 @@ class TradingCycleService:
     ) -> None:
         if self.strategy.name != "smart_grid_ai":
             return
-        if signal.reason != "grid_recenter_wait":
+        if signal.reason != "grid_recenter_wait" and not signal.reason.startswith("grid_recentered_auto"):
             return
         now = datetime.now(UTC)
         cooldown_minutes = self.settings.trading.grid_out_of_bounds_alert_cooldown_minutes
@@ -413,7 +531,7 @@ class TradingCycleService:
                     f"Price: {mark_price}\n"
                     f"Grid lower: {lower}\n"
                     f"Grid upper: {upper}\n"
-                    f"Action: waiting for recenter"
+                    f"Action: auto recenter engaged"
                 ),
             )
         await log_event(
@@ -512,10 +630,13 @@ class TradingCycleService:
         session: AsyncSession,
         position: Position,
         mark_price: Decimal,
+        signal_reason: str,
     ) -> CycleResult | None:
         if self.strategy.name != "smart_grid_ai":
             return None
         if not self.settings.trading.grid_auto_inventory_bootstrap:
+            return None
+        if signal_reason not in {"grid_sell_rebalance", "grid_take_profit_buffer_hit"}:
             return None
         equity = await self._get_current_equity(session)
         current_exposure = position.quantity * mark_price
@@ -653,6 +774,24 @@ class TradingCycleService:
             return self.starting_equity
         return Decimal(str(snapshot.equity))
 
+    def _compute_equity_from_position(self, *, position: Position, mark_price: Decimal) -> Decimal:
+        quantity = Decimal(str(position.quantity))
+        realized = Decimal(str(position.realized_pnl))
+        avg_entry = Decimal(str(position.avg_entry_price))
+        unrealized = Decimal("0")
+        if quantity > 0 and avg_entry > 0:
+            unrealized = (mark_price - avg_entry) * quantity
+        return self.starting_equity + realized + unrealized
+
+    async def _get_peak_equity(self, session: AsyncSession) -> Decimal:
+        result = await session.execute(
+            select(func.max(EquitySnapshot.equity)).where(EquitySnapshot.is_paper.is_(True))
+        )
+        peak = result.scalar_one_or_none()
+        if peak is None:
+            return self.starting_equity
+        return max(self.starting_equity, Decimal(str(peak)))
+
     async def _cooldown_remaining_seconds(self, session: AsyncSession) -> int:
         if self.grid_cooldown_seconds <= 0:
             return 0
@@ -781,11 +920,14 @@ class TradingCycleService:
         )
 
 _trading_cycle_service: TradingCycleService | None = None
+_trading_cycle_service_lock = threading.Lock()
 
 
 def get_trading_cycle_service() -> TradingCycleService:
     """Get or create singleton trading cycle service."""
     global _trading_cycle_service
     if _trading_cycle_service is None:
-        _trading_cycle_service = TradingCycleService()
+        with _trading_cycle_service_lock:
+            if _trading_cycle_service is None:
+                _trading_cycle_service = TradingCycleService()
     return _trading_cycle_service

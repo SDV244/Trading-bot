@@ -105,6 +105,11 @@ class ConfigResponse(BaseModel):
     grid_enforce_fee_floor: bool
     grid_min_net_profit_bps: int
     grid_out_of_bounds_alert_cooldown_minutes: int
+    grid_recenter_mode: str
+    stop_loss_enabled: bool
+    stop_loss_global_equity_pct: float
+    stop_loss_max_drawdown_pct: float
+    stop_loss_auto_close_positions: bool
     risk_per_trade: float
     max_daily_loss: float
     max_exposure: float
@@ -150,6 +155,22 @@ class LiveOrderResponse(BaseModel):
     price: str | None
 
 
+class GridRecenterModeUpdateRequest(BaseModel):
+    """Grid recenter mode update payload."""
+
+    mode: str = Field(..., pattern="^(conservative|aggressive)$")
+    reason: str = Field(default="dashboard_update")
+    changed_by: str = Field(default="web_dashboard")
+
+
+class GridRecenterModeUpdateResponse(BaseModel):
+    """Grid recenter mode update response."""
+
+    active_strategy: str
+    mode: str
+    applied_to_live_strategy: bool
+
+
 async def _ensure_database() -> None:
     from packages.core.database.session import init_database
 
@@ -163,8 +184,13 @@ async def get_trading_config(
     """Get current trading configuration."""
     from packages.core.config import get_settings
     from packages.core.strategies import registry
+    from packages.core.trading_cycle import get_trading_cycle_service
 
     settings = get_settings()
+    service = get_trading_cycle_service()
+    effective_recenter_mode = settings.trading.grid_recenter_mode
+    if service.strategy.name == "smart_grid_ai":
+        effective_recenter_mode = cast(str, getattr(service.strategy, "recenter_mode", effective_recenter_mode))
     return ConfigResponse(
         trading_pair=settings.trading.pair,
         timeframes=settings.trading.timeframe_list,
@@ -191,12 +217,57 @@ async def get_trading_config(
         grid_enforce_fee_floor=settings.trading.grid_enforce_fee_floor,
         grid_min_net_profit_bps=settings.trading.grid_min_net_profit_bps,
         grid_out_of_bounds_alert_cooldown_minutes=settings.trading.grid_out_of_bounds_alert_cooldown_minutes,
+        grid_recenter_mode=effective_recenter_mode,
+        stop_loss_enabled=settings.trading.stop_loss_enabled,
+        stop_loss_global_equity_pct=settings.trading.stop_loss_global_equity_pct,
+        stop_loss_max_drawdown_pct=settings.trading.stop_loss_max_drawdown_pct,
+        stop_loss_auto_close_positions=settings.trading.stop_loss_auto_close_positions,
         risk_per_trade=settings.risk.per_trade,
         max_daily_loss=settings.risk.max_daily_loss,
         max_exposure=settings.risk.max_exposure,
         fee_bps=settings.risk.fee_bps,
         slippage_bps=settings.risk.slippage_bps,
         approval_timeout_hours=settings.approval.timeout_hours,
+    )
+
+
+@router.post("/config/recenter-mode", response_model=GridRecenterModeUpdateResponse)
+async def set_grid_recenter_mode(
+    payload: GridRecenterModeUpdateRequest,
+    _: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> GridRecenterModeUpdateResponse:
+    """Update smart-grid recenter behavior (conservative/aggressive)."""
+    from packages.core.audit import log_event
+    from packages.core.config import get_settings
+    from packages.core.database.session import get_session
+    from packages.core.trading_cycle import get_trading_cycle_service
+
+    await _ensure_database()
+    service = get_trading_cycle_service()
+    mode = service.set_grid_recenter_mode(payload.mode)
+    get_settings().trading.grid_recenter_mode = mode
+    applied = service.strategy.name == "smart_grid_ai"
+
+    async with get_session() as session:
+        await log_event(
+            session,
+            event_type="grid_recenter_mode_changed",
+            event_category="config",
+            summary=f"Grid recenter mode changed to {mode}",
+            details={
+                "mode": mode,
+                "active_strategy": service.strategy.name,
+                "applied_to_live_strategy": applied,
+                "reason": payload.reason,
+            },
+            actor=payload.changed_by or "web_dashboard",
+        )
+        await session.commit()
+
+    return GridRecenterModeUpdateResponse(
+        active_strategy=service.strategy.name,
+        mode=mode,
+        applied_to_live_strategy=applied,
     )
 
 

@@ -41,6 +41,11 @@ export function ConfigPage() {
           <p>Enforce Fee Floor: {String(config?.grid_enforce_fee_floor ?? false)}</p>
           <p>Min Net Profit Floor: {config?.grid_min_net_profit_bps ?? "-"} bps</p>
           <p>Out-of-Bounds Alert Cooldown: {config?.grid_out_of_bounds_alert_cooldown_minutes ?? "-"} min</p>
+          <p>Recenter Mode: {config?.grid_recenter_mode ?? "-"}</p>
+          <p>Global Stop-Loss Enabled: {String(config?.stop_loss_enabled ?? false)}</p>
+          <p>Global Equity Stop: {formatNumber((config?.stop_loss_global_equity_pct ?? 0) * 100, 2)}%</p>
+          <p>Max Drawdown Stop: {formatNumber((config?.stop_loss_max_drawdown_pct ?? 0) * 100, 2)}%</p>
+          <p>Auto-Close on Stop: {String(config?.stop_loss_auto_close_positions ?? false)}</p>
         </div>
       </article>
       <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">

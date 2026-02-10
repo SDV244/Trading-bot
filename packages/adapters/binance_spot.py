@@ -6,15 +6,17 @@ Includes klines fetching, retry logic, and rate limit handling.
 """
 
 import asyncio
+import threading
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
-import time
 from typing import Any, cast
 
 import httpx
 from loguru import logger
 from pydantic import BaseModel
 
+from packages.core.circuit_breaker import CircuitBreaker, CircuitBreakerConfig
 from packages.core.config import get_settings
 
 JSONDict = dict[str, Any]
@@ -65,6 +67,15 @@ class BinanceSpotAdapter:
         self._last_request_ts = 0.0
         self._max_retries = max(1, settings.binance.market_max_retries)
         self._min_interval_ms = max(0, settings.binance.market_min_interval_ms)
+        self._circuit_breaker = CircuitBreaker(
+            "binance_spot",
+            CircuitBreakerConfig(
+                failure_threshold=settings.binance.circuit_breaker_failure_threshold,
+                success_threshold=settings.binance.circuit_breaker_success_threshold,
+                timeout_seconds=settings.binance.circuit_breaker_timeout_seconds,
+                window_seconds=settings.binance.circuit_breaker_window_seconds,
+            ),
+        )
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create the HTTP client."""
@@ -114,7 +125,7 @@ class BinanceSpotAdapter:
                 # Check rate limit
                 await self._check_rate_limit(weight)
 
-                response = await client.request(method, endpoint, params=params)
+                response = await self._circuit_breaker.call(client.request, method, endpoint, params=params)
 
                 # Update rate limit from headers
                 self._update_rate_limit(response)
@@ -318,13 +329,16 @@ class BinanceSpotAdapter:
 
 # Singleton instance
 _adapter: BinanceSpotAdapter | None = None
+_adapter_lock = threading.Lock()
 
 
 def get_binance_adapter() -> BinanceSpotAdapter:
     """Get or create the Binance adapter singleton."""
     global _adapter
     if _adapter is None:
-        _adapter = BinanceSpotAdapter()
+        with _adapter_lock:
+            if _adapter is None:
+                _adapter = BinanceSpotAdapter()
     return _adapter
 
 

@@ -50,6 +50,7 @@ class SmartAdaptiveGridStrategy(Strategy):
     stop_loss_buffer: float = 0.05
     regime_fast_period_4h: int = 21
     regime_slow_period_4h: int = 55
+    recenter_mode: str = "aggressive"
 
     def data_requirements(self) -> dict[str, int]:
         return {
@@ -66,6 +67,9 @@ class SmartAdaptiveGridStrategy(Strategy):
                 reason="invalid_grid_spacing_mode",
                 indicators={},
             )
+        recenter_mode = self.recenter_mode.strip().lower()
+        if recenter_mode not in {"conservative", "aggressive"}:
+            recenter_mode = "aggressive"
 
         closes_1h = [c.close for c in context.candles_1h]
         highs_1h = [c.high for c in context.candles_1h]
@@ -153,6 +157,7 @@ class SmartAdaptiveGridStrategy(Strategy):
             "prev_close": float(prev_close),
             "buy_trigger": float(buy_trigger),
             "sell_trigger": float(sell_trigger),
+            "recenter_mode_aggressive": 1.0 if recenter_mode == "aggressive" else 0.0,
         }
 
         if self.take_profit_buffer > 0:
@@ -176,6 +181,46 @@ class SmartAdaptiveGridStrategy(Strategy):
                     indicators=indicators,
                 )
 
+        if last_close < lower_band or last_close > upper_band:
+            # Auto-recenter: when price escapes the active band, anchor a new band to
+            # current price so the next cycles can continue operating without deadlock.
+            recentered_center = last_close
+            recentered_upper = recentered_center + (step * half_levels)
+            recentered_lower = recentered_center - (step * half_levels)
+            recentered_buy_trigger = recentered_center - step
+            recentered_sell_trigger = recentered_center + step
+            indicators.update(
+                {
+                    "recentered": 1.0,
+                    "recenter_from_center": float(tilted_center),
+                    "recenter_from_upper": float(upper_band),
+                    "recenter_from_lower": float(lower_band),
+                    "grid_center": float(recentered_center),
+                    "grid_upper": float(recentered_upper),
+                    "grid_lower": float(recentered_lower),
+                    "buy_trigger": float(recentered_buy_trigger),
+                    "sell_trigger": float(recentered_sell_trigger),
+                }
+            )
+            if recenter_mode == "aggressive":
+                broke_out_up = prev_close <= upper_band and last_close > upper_band
+                broke_out_down = prev_close >= lower_band and last_close < lower_band
+                if broke_out_up:
+                    return Signal(
+                        side="BUY",
+                        confidence=max(confidence, 0.65),
+                        reason="grid_recentered_auto_breakout_buy",
+                        indicators=indicators,
+                    )
+                if broke_out_down:
+                    return Signal(
+                        side="SELL",
+                        confidence=max(confidence, 0.65),
+                        reason="grid_recentered_auto_breakdown_sell",
+                        indicators=indicators,
+                    )
+            return Signal(side="HOLD", confidence=confidence, reason="grid_recentered_auto", indicators=indicators)
+
         # Grid rebalance entry/exit: react when price crosses next level.
         if prev_close > buy_trigger and last_close <= buy_trigger:
             return Signal(
@@ -191,9 +236,6 @@ class SmartAdaptiveGridStrategy(Strategy):
                 reason="grid_sell_rebalance",
                 indicators=indicators,
             )
-
-        if last_close < lower_band or last_close > upper_band:
-            return Signal(side="HOLD", confidence=confidence, reason="grid_recenter_wait", indicators=indicators)
 
         return Signal(side="HOLD", confidence=0.25, reason="grid_wait_inside_band", indicators=indicators)
 

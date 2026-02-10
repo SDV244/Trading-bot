@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal
 from typing import Any
+from uuid import uuid4
 
 from packages.adapters.binance_live import get_binance_live_adapter
 from packages.core.config import get_settings
@@ -60,13 +61,23 @@ class LiveEngine:
     ) -> LiveOrderResult:
         self._validate_preconditions(order, checklist)
         normalized_quantity = await self._validate_symbol_filters(order.symbol, order.quantity)
-
-        response = await get_binance_live_adapter().place_market_order(
-            symbol=order.symbol,
-            side=order.side,
-            quantity=normalized_quantity,
-            new_client_order_id=client_order_id,
-        )
+        effective_client_order_id = client_order_id or self._generate_client_order_id()
+        adapter = get_binance_live_adapter()
+        try:
+            response = await adapter.place_market_order(
+                symbol=order.symbol,
+                side=order.side,
+                quantity=normalized_quantity,
+                new_client_order_id=effective_client_order_id,
+            )
+        except Exception:
+            recovered = await adapter.query_order(
+                symbol=order.symbol,
+                client_order_id=effective_client_order_id,
+            )
+            if recovered is None:
+                raise
+            response = recovered
         status = str(response.get("status", "")).upper()
         executed_qty = Decimal(str(response.get("executedQty", "0")))
         cumm_quote_qty = Decimal(str(response.get("cummulativeQuoteQty", "0")))
@@ -77,7 +88,9 @@ class LiveEngine:
             accepted=accepted,
             reason=f"exchange_status_{status or 'UNKNOWN'}",
             order_id=str(response.get("orderId")) if response.get("orderId") is not None else None,
-            client_order_id=str(response.get("clientOrderId")) if response.get("clientOrderId") else client_order_id,
+            client_order_id=(
+                str(response.get("clientOrderId")) if response.get("clientOrderId") else effective_client_order_id
+            ),
             quantity=executed_qty if executed_qty > 0 else normalized_quantity,
             price=avg_price,
             raw=response,
@@ -119,3 +132,7 @@ class LiveEngine:
         # MIN_NOTIONAL is exchange-enforced and depends on execution price.
         # We keep authoritative validation at order placement response.
         return normalized_quantity
+
+    @staticmethod
+    def _generate_client_order_id() -> str:
+        return f"live_{uuid4().hex[:24]}"

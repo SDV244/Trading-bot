@@ -84,6 +84,12 @@ export function explainRiskReason(reason: string | null | undefined): string {
       return "Price is inside the active grid band. Waiting for next grid trigger cross.";
     case "grid_recenter_wait":
       return "Price is outside the active band. Strategy is waiting for re-center conditions.";
+    case "grid_recentered_auto":
+      return "Price moved outside the active grid. Strategy auto-recentered the band and is monitoring next trigger.";
+    case "grid_recentered_auto_breakout_buy":
+      return "Price broke above the old band. Strategy auto-recentered and entered breakout BUY mode.";
+    case "grid_recentered_auto_breakdown_sell":
+      return "Price broke below the old band. Strategy auto-recentered and signaled defensive SELL.";
     case "grid_inventory_bootstrap":
       return "Smart grid seeded a starter BUY inventory so future SELL grid levels can execute.";
     case "insufficient_data":

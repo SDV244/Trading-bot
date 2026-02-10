@@ -218,6 +218,7 @@ class TestTradingEndpoints:
         monkeypatch.setenv("TRADING_GRID_ENFORCE_FEE_FLOOR", "false")
         monkeypatch.setenv("TRADING_GRID_MIN_NET_PROFIT_BPS", "30")
         monkeypatch.setenv("TRADING_GRID_COOLDOWN_SECONDS", "0")
+        monkeypatch.setenv("TRADING_GRID_RECENTER_MODE", "aggressive")
         reload_settings()
         client = TestClient(app)
         response = client.get("/api/trading/config")
@@ -239,6 +240,31 @@ class TestTradingEndpoints:
         assert data["grid_auto_inventory_bootstrap"] is True
         assert data["grid_enforce_fee_floor"] is False
         assert data["grid_min_net_profit_bps"] == 30
+        assert data["grid_recenter_mode"] == "aggressive"
+        assert data["stop_loss_enabled"] is True
+        assert data["stop_loss_global_equity_pct"] == 0.15
+        assert data["stop_loss_max_drawdown_pct"] == 0.2
+
+    def test_set_grid_recenter_mode(self, monkeypatch):
+        """Can update smart-grid recenter mode at runtime from API."""
+        monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "smart_grid_ai")
+        monkeypatch.setenv("TRADING_GRID_RECENTER_MODE", "aggressive")
+        reload_settings()
+        client = TestClient(app)
+
+        response = client.post(
+            "/api/trading/config/recenter-mode",
+            json={"mode": "conservative", "reason": "test", "changed_by": "tester"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["mode"] == "conservative"
+        assert data["active_strategy"] == "smart_grid_ai"
+        assert data["applied_to_live_strategy"] is True
+
+        updated = client.get("/api/trading/config")
+        assert updated.status_code == 200
+        assert updated.json()["grid_recenter_mode"] == "conservative"
 
     def test_get_position(self):
         """Can get current position."""

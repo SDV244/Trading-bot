@@ -5,6 +5,7 @@ All configuration is loaded from environment variables or .env file.
 """
 
 import os
+import threading
 from enum import Enum
 from pathlib import Path
 from typing import Any, TypeVar, cast
@@ -54,6 +55,30 @@ class BinanceSettings(BaseSettings):
         ge=0,
         le=10_000,
         description="Minimum spacing between public market-data API requests",
+    )
+    circuit_breaker_failure_threshold: int = Field(
+        default=5,
+        ge=1,
+        le=100,
+        description="Failures within breaker window required to open adapter circuit breaker",
+    )
+    circuit_breaker_success_threshold: int = Field(
+        default=2,
+        ge=1,
+        le=20,
+        description="Successful calls in half-open state required to close breaker",
+    )
+    circuit_breaker_timeout_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+        description="Seconds breaker stays open before allowing recovery probe",
+    )
+    circuit_breaker_window_seconds: int = Field(
+        default=60,
+        ge=1,
+        le=3600,
+        description="Sliding window for adapter failure counting",
     )
 
     @property
@@ -184,6 +209,31 @@ class TradingSettings(BaseSettings):
         ge=1,
         le=1440,
         description="Minimum minutes between repeated out-of-bounds alerts",
+    )
+    stop_loss_enabled: bool = Field(
+        default=True,
+        description="Enable global equity/drawdown stop-loss guard",
+    )
+    stop_loss_global_equity_pct: float = Field(
+        default=0.15,
+        ge=0.01,
+        le=0.95,
+        description="Emergency stop if equity drops this fraction below starting equity",
+    )
+    stop_loss_max_drawdown_pct: float = Field(
+        default=0.20,
+        ge=0.01,
+        le=0.95,
+        description="Emergency stop if drawdown from peak equity exceeds this fraction",
+    )
+    stop_loss_auto_close_positions: bool = Field(
+        default=True,
+        description="When stop-loss triggers, force-close open paper positions before halting",
+    )
+    grid_recenter_mode: str = Field(
+        default="aggressive",
+        pattern="^(conservative|aggressive)$",
+        description="Out-of-band recenter behavior: conservative (wait) or aggressive (breakout/breakdown action)",
     )
     advisor_interval_cycles: int = Field(
         default=30,
@@ -325,6 +375,7 @@ class Settings(BaseSettings):
 
 # Global settings instance
 _settings: Settings | None = None
+_settings_lock = threading.Lock()
 SettingsSection = TypeVar("SettingsSection", bound=BaseSettings)
 
 
@@ -332,15 +383,18 @@ def get_settings() -> Settings:
     """Get or create the global settings instance."""
     global _settings
     if _settings is None:
-        _settings = _load_settings()
+        with _settings_lock:
+            if _settings is None:
+                _settings = _load_settings()
     return _settings
 
 
 def reload_settings() -> Settings:
     """Force reload settings from environment."""
     global _settings
-    _settings = _load_settings()
-    return _settings
+    with _settings_lock:
+        _settings = _load_settings()
+        return _settings
 
 
 def _build_settings_section(

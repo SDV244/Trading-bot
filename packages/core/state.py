@@ -5,6 +5,7 @@ Handles the global system state (RUNNING, PAUSED, EMERGENCY_STOP)
 with thread-safe operations and persistence.
 """
 
+import threading
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Any
@@ -185,11 +186,14 @@ class StateManager:
 
 # Global state manager instance
 _state_manager: StateManager | None = None
+_state_manager_lock = threading.Lock()
 
 
 def get_state_manager() -> StateManager:
     """Get or create global state manager."""
     global _state_manager
     if _state_manager is None:
-        _state_manager = StateManager()
+        with _state_manager_lock:
+            if _state_manager is None:
+                _state_manager = StateManager()
     return _state_manager

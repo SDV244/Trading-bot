@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -56,11 +57,14 @@ class TelegramNotifier:
 
 
 _notifier: TelegramNotifier | None = None
+_notifier_lock = threading.Lock()
 
 
 def get_telegram_notifier() -> TelegramNotifier:
     """Get or create singleton notifier."""
     global _notifier
     if _notifier is None:
-        _notifier = TelegramNotifier()
+        with _notifier_lock:
+            if _notifier is None:
+                _notifier = TelegramNotifier()
     return _notifier

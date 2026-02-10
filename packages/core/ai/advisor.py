@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Any
@@ -257,11 +258,14 @@ class AIAdvisor:
 
 
 _advisor: AIAdvisor | None = None
+_advisor_lock = threading.Lock()
 
 
 def get_ai_advisor() -> AIAdvisor:
     """Get or create singleton advisor."""
     global _advisor
     if _advisor is None:
-        _advisor = AIAdvisor()
+        with _advisor_lock:
+            if _advisor is None:
+                _advisor = AIAdvisor()
     return _advisor
