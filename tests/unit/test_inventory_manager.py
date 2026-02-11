@@ -29,3 +29,16 @@ def test_time_stop_triggers_exit() -> None:
     assert decision.action == "REDUCE_ALL"
     assert "time_stop" in decision.reason
 
+
+def test_volatility_aware_evaluation_and_stats() -> None:
+    manager = InventoryManager()
+    decision = manager.evaluate_with_volatility(
+        current_price=Decimal("101.8"),
+        avg_entry=Decimal("100"),
+        current_quantity=Decimal("1.0"),
+        hours_in_position=6,
+        volatility_percentile=0.9,
+    )
+    stats = manager.get_statistics()
+    assert decision.action in {"HOLD", "REDUCE_25", "REDUCE_50", "REDUCE_ALL"}
+    assert stats["decisions_total"] >= 1

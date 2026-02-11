@@ -470,6 +470,7 @@ class TradingCycleService:
                 session=session,
                 position=position,
                 mark_price=last_price,
+                volatility_percentile=signal.indicators.get("volatility_percentile"),
             )
             if inventory_decision is not None and inventory_decision.action != "HOLD":
                 forced_sell_quantity = max(Decimal("0"), Decimal(str(position.quantity)) - inventory_decision.target_quantity)
@@ -1192,17 +1193,22 @@ class TradingCycleService:
         session: AsyncSession,
         position: Position,
         mark_price: Decimal,
+        volatility_percentile: Any | None = None,
     ) -> InventoryDecision | None:
         quantity = Decimal(str(position.quantity))
         avg_entry = Decimal(str(position.avg_entry_price))
         if quantity <= 0 or avg_entry <= 0:
             return None
         hours_open = await self._hours_in_open_position(session)
-        decision = self.inventory_manager.evaluate(
+        vol_pct = 0.5
+        if isinstance(volatility_percentile, int | float):
+            vol_pct = max(0.0, min(1.0, float(volatility_percentile)))
+        decision = self.inventory_manager.evaluate_with_volatility(
             current_price=mark_price,
             avg_entry=avg_entry,
             current_quantity=quantity,
             hours_in_position=hours_open,
+            volatility_percentile=vol_pct,
         )
         return decision
 

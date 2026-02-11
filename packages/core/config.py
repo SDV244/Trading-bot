@@ -408,6 +408,39 @@ class LLMSettings(BaseSettings):
         default=True,
         description="Fallback to built-in rule proposals when LLM returns no valid proposals",
     )
+    fallback_enabled: bool = Field(
+        default=False,
+        description="Enable provider failover when the primary LLM request fails",
+    )
+    fallback_provider: str = Field(
+        default="ollama",
+        pattern="^(openai|anthropic|gemini|ollama)$",
+        description="Fallback LLM provider key",
+    )
+    fallback_model: str = Field(
+        default="llama3.1:8b",
+        description="Fallback provider model name",
+    )
+    fallback_api_key: str = Field(
+        default="",
+        description="Fallback provider API key (not required for local Ollama)",
+    )
+    fallback_base_url: str = Field(
+        default="http://127.0.0.1:11434/api/chat",
+        description="Optional fallback provider base URL override",
+    )
+    fallback_timeout_seconds: int = Field(
+        default=120,
+        ge=5,
+        le=300,
+        description="Fallback provider request timeout in seconds",
+    )
+    fallback_max_retries: int = Field(
+        default=1,
+        ge=0,
+        le=5,
+        description="Fallback provider retry attempts",
+    )
     system_prompt: str = Field(
         default=(
             "You are a senior crypto spot-grid risk advisor. Output strict JSON only. "
@@ -430,6 +463,12 @@ class MultiAgentSettings(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Minimum confidence to keep agent proposal",
+    )
+    agent_timeout_seconds: int = Field(
+        default=45,
+        ge=5,
+        le=300,
+        description="Max time per specialist agent call before skip",
     )
     meta_agent_enabled: bool = Field(default=True, description="Enable meta-agent merge/ranking step")
     strategy_agent_enabled: bool = Field(default=True, description="Enable strategy specialist agent")

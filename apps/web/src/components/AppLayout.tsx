@@ -1,19 +1,27 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 
-import { useAuth } from "../auth";
+import type { Role } from "../api";
+import { hasMinRole, useAuth } from "../auth";
 import { useDashboard } from "../dashboard";
 import { formatRelativeSeconds } from "../utils";
 import { StateBadge } from "./Badge";
 
-const NAV_ITEMS = [
-  { to: "/", label: "Home" },
-  { to: "/trading", label: "Trading" },
-  { to: "/chart", label: "Chart" },
-  { to: "/config", label: "Config" },
-  { to: "/approvals", label: "AI Approvals" },
-  { to: "/logs", label: "Logs" },
-  { to: "/controls", label: "Controls" },
+type NavItem = {
+  to: string;
+  label: string;
+  minRole: Role;
+};
+
+const NAV_ITEMS: NavItem[] = [
+  { to: "/", label: "Home", minRole: "viewer" },
+  { to: "/trading", label: "Trading", minRole: "viewer" },
+  { to: "/intelligence", label: "AI Center", minRole: "operator" },
+  { to: "/chart", label: "Chart", minRole: "viewer" },
+  { to: "/config", label: "Config", minRole: "viewer" },
+  { to: "/approvals", label: "AI Approvals", minRole: "operator" },
+  { to: "/logs", label: "Logs", minRole: "viewer" },
+  { to: "/controls", label: "Controls", minRole: "operator" },
 ];
 
 export function AppLayout() {
@@ -64,18 +72,20 @@ export function AppLayout() {
 
         <nav className="mb-6 flex flex-wrap gap-2 rounded-xl border border-white/10 bg-white/5 p-2 backdrop-blur">
           {NAV_ITEMS.map((item) => (
-            <NavLink
-              key={item.to}
-              className={({ isActive }) =>
-                `rounded-md px-3 py-2 text-xs uppercase tracking-[0.18em] ${
-                  isActive ? "bg-mint/20 text-mint" : "text-slate-300 hover:bg-white/10"
-                }`
-              }
-              to={item.to}
-              end={item.to === "/"}
-            >
-              {item.label}
-            </NavLink>
+            !authEnabled || hasMinRole(user?.role, item.minRole) ? (
+              <NavLink
+                key={item.to}
+                className={({ isActive }) =>
+                  `rounded-md px-3 py-2 text-xs uppercase tracking-[0.18em] ${
+                    isActive ? "bg-mint/20 text-mint" : "text-slate-300 hover:bg-white/10"
+                  }`
+                }
+                to={item.to}
+                end={item.to === "/"}
+              >
+                {item.label}
+              </NavLink>
+            ) : null
           ))}
         </nav>
 

@@ -4,10 +4,14 @@ import {
   api,
   type Approval,
   type AuditEvent,
+  type EmergencyAISettings,
+  type EmergencyAnalysisStatus,
   type EquityPoint,
   type Fill,
   type Funds,
   type GridPreview,
+  type LLMStatus,
+  type MarketIntelligence,
   type MarketCandle,
   type MarketPrice,
   type Metrics,
@@ -38,7 +42,11 @@ type DashboardData = {
   events: AuditEvent[];
   marketCandles: MarketCandle[];
   marketPrice: MarketPrice | null;
+  marketIntelligence: MarketIntelligence | null;
+  emergencyAnalysis: EmergencyAnalysisStatus | null;
+  emergencySettings: EmergencyAISettings | null;
   gridPreview: GridPreview | null;
+  llmStatus: LLMStatus | null;
   lastCycle: PaperCycleResult | null;
 };
 
@@ -72,7 +80,11 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     events: [],
     marketCandles: [],
     marketPrice: null,
+    marketIntelligence: null,
+    emergencyAnalysis: null,
+    emergencySettings: null,
     gridPreview: null,
+    llmStatus: null,
     lastCycle: null,
   });
   const [loading, setLoading] = useState(true);
@@ -82,7 +94,7 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
     try {
       const config = await api.getTradingConfig();
       const symbol = config.trading_pair;
-      const [health, ready, systemReadiness, system, scheduler, position, funds, metrics, orders, fills, equity, approvals, events, marketCandles, marketPrice, gridPreview] =
+      const [health, ready, systemReadiness, system, scheduler, position, funds, metrics, orders, fills, equity, approvals, events, marketCandles, marketPrice, marketIntelligence, emergencyAnalysis, emergencySettings, gridPreview, llmStatus] =
         await Promise.all([
           api.health(),
           api.ready(),
@@ -99,7 +111,11 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
           api.listEvents({ limit: 20 }),
           api.getMarketCandles(symbol, "1h", 120).catch(() => []),
           api.getMarketPrice(symbol).catch(() => null),
+          api.getMarketIntelligence(symbol, "1h", 240).catch(() => null),
+          api.getLastEmergencyAnalysis().catch(() => null),
+          api.getEmergencyAISettings().catch(() => null),
           api.getGridPreview().catch(() => null),
+          api.getLLMStatus().catch(() => null),
         ]);
       setData((prev) => ({
         ...prev,
@@ -120,7 +136,11 @@ export function DashboardProvider({ children }: { children: ReactNode }) {
         events,
         marketCandles,
         marketPrice,
+        marketIntelligence,
+        emergencyAnalysis,
+        emergencySettings,
         gridPreview,
+        llmStatus,
       }));
       setError(null);
     } catch (e) {

@@ -4,6 +4,15 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  --bg-ink: #081321;
+  --bg-sea: #0f3042;
+  --bg-fog: #173d53;
+  --accent-mint: #2dd4bf;
+  --accent-ember: #fb923c;
+  --text-main: #d0d8e5;
+}
+
 * {
   box-sizing: border-box;
 }
@@ -17,4 +26,27 @@ body,
 
 body {
   font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: var(--text-main);
+  background:
+    radial-gradient(circle at 12% 12%, rgba(45, 212, 191, 0.15), transparent 36%),
+    radial-gradient(circle at 88% 22%, rgba(251, 146, 60, 0.13), transparent 34%),
+    linear-gradient(135deg, var(--bg-ink), var(--bg-sea) 48%, var(--bg-fog));
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 48, 66, 0.4);
+}
+
+::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: rgba(45, 212, 191, 0.35);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(45, 212, 191, 0.55);
 }

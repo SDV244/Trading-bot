@@ -83,9 +83,17 @@ class MarketRegimeDetector:
     historical depth is limited.
     """
 
-    def __init__(self, *, volatility_history_size: int = 252) -> None:
+    def __init__(
+        self,
+        *,
+        volatility_history_size: int = 252,
+        regime_history_size: int = 1_000,
+    ) -> None:
         self.volatility_history_size = max(30, volatility_history_size)
+        self.regime_history_size = max(60, regime_history_size)
         self._volatility_history: list[float] = []
+        self._regime_history: list[MarketRegime] = []
+        self._transition_counts: dict[MarketRegime, dict[MarketRegime, int]] = {}
 
     def detect_regime(
         self,
@@ -124,6 +132,11 @@ class MarketRegimeDetector:
             hurst=hurst,
             breakout_probability=breakout_prob,
         )
+        self._record_regime(regime)
+        persistence_score = self.get_regime_persistence_score(regime)
+        transition_probabilities = self.get_regime_transition_probability(regime)
+        most_likely_next = max(transition_probabilities.items(), key=lambda item: item[1])[0]
+        most_likely_next_prob = transition_probabilities[most_likely_next]
 
         indicators = {
             "trend_strength": trend_strength,
@@ -134,6 +147,9 @@ class MarketRegimeDetector:
             "breakout_probability": breakout_prob,
             "regime_code": float(regime.code),
             "regime_confidence": confidence,
+            "regime_persistence_score": persistence_score,
+            "regime_next_code": float(most_likely_next.code),
+            "regime_next_probability": most_likely_next_prob,
         }
         return RegimeAnalysis(
             regime=regime,
@@ -144,6 +160,57 @@ class MarketRegimeDetector:
             breakout_probability=breakout_prob,
             indicators=indicators,
         )
+
+    def get_regime_transition_probability(self, current_regime: MarketRegime) -> dict[MarketRegime, float]:
+        """
+        Return Markov-style transition probabilities from `current_regime`.
+
+        Falls back to a conservative self-persistence prior when history is sparse.
+        """
+        next_counts = self._transition_counts.get(current_regime, {})
+        total = sum(next_counts.values())
+        if total <= 0:
+            # Prior: market tends to persist more than it transitions abruptly.
+            regimes = list(MarketRegime)
+            base = 0.40 / max(1, len(regimes) - 1)
+            probabilities = {regime: base for regime in regimes}
+            probabilities[current_regime] = 0.60
+            return probabilities
+
+        probabilities = {regime: 0.0 for regime in MarketRegime}
+        for regime, count in next_counts.items():
+            probabilities[regime] = count / total
+        return probabilities
+
+    def get_regime_persistence_score(
+        self,
+        regime: MarketRegime,
+        *,
+        lookback: int = 30,
+    ) -> float:
+        """
+        Compute stability score [0,1] of the active regime.
+
+        A higher score means the regime has persisted for more consecutive samples.
+        """
+        if not self._regime_history:
+            return 0.5
+        window = self._regime_history[-max(1, lookback) :]
+        if not window:
+            return 0.5
+        consecutive = 0
+        for item in reversed(window):
+            if item == regime:
+                consecutive += 1
+            else:
+                break
+        score = consecutive / max(1, min(len(window), lookback // 2 or 1))
+        return float(max(0.0, min(1.0, score)))
+
+    @property
+    def regime_history(self) -> tuple[MarketRegime, ...]:
+        """Immutable snapshot of recent detected regimes."""
+        return tuple(self._regime_history)
 
     def recommended_adaptation(
         self,
@@ -231,8 +298,22 @@ class MarketRegimeDetector:
                 "available_points": float(points),
                 "regime_code": float(MarketRegime.UNKNOWN.code),
                 "regime_confidence": 0.0,
+                "regime_persistence_score": 0.5,
+                "regime_next_code": float(MarketRegime.UNKNOWN.code),
+                "regime_next_probability": 1.0,
             },
         )
+
+    def _record_regime(self, regime: MarketRegime) -> None:
+        previous = self._regime_history[-1] if self._regime_history else None
+        self._regime_history.append(regime)
+        if len(self._regime_history) > self.regime_history_size:
+            self._regime_history = self._regime_history[-self.regime_history_size :]
+
+        if previous is None:
+            return
+        transitions = self._transition_counts.setdefault(previous, {})
+        transitions[regime] = transitions.get(regime, 0) + 1
 
     def _detect_trend(self, prices: np.ndarray) -> tuple[float, int]:
         if len(prices) < 10:

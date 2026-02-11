@@ -37,6 +37,9 @@ class InventoryManager:
         self.time_stop_hours = max(1, time_stop_hours)
         self.min_profit_for_time_stop = max(0.0, min_profit_for_time_stop)
         self._high_water_mark: Decimal | None = None
+        self._decision_counts: dict[str, int] = {"HOLD": 0}
+        self._recent_exit_returns: list[float] = []
+        self._max_exit_samples = 200
 
     def evaluate(
         self,
@@ -47,32 +50,72 @@ class InventoryManager:
         hours_in_position: int,
     ) -> InventoryDecision:
         """Evaluate whether current inventory should be reduced."""
+        return self.evaluate_with_volatility(
+            current_price=current_price,
+            avg_entry=avg_entry,
+            current_quantity=current_quantity,
+            hours_in_position=hours_in_position,
+            volatility_percentile=0.5,
+        )
+
+    def evaluate_with_volatility(
+        self,
+        *,
+        current_price: Decimal,
+        avg_entry: Decimal,
+        current_quantity: Decimal,
+        hours_in_position: int,
+        volatility_percentile: float = 0.5,
+    ) -> InventoryDecision:
+        """
+        Evaluate inventory decisions with volatility-aware thresholds.
+
+        Higher volatility tightens time-stop and enables earlier profit lock,
+        while giving more room to trailing stops to avoid noise exits.
+        """
+        vol = max(0.0, min(1.0, float(volatility_percentile)))
+        trailing_multiplier = Decimal(str(1.0 + (vol * 0.35)))
+        adjusted_trailing_stop = Decimal(str(self.trailing_stop_pct)) * trailing_multiplier
+        time_stop_multiplier = Decimal(str(max(0.60, 1.0 - (vol * 0.25))))
+        adjusted_time_stop_hours = max(1, int(Decimal(self.time_stop_hours) * time_stop_multiplier))
+        adjusted_profit_levels = self._adjust_profit_levels_for_volatility(vol)
+
         if current_quantity <= 0 or avg_entry <= 0 or current_price <= 0:
             self._high_water_mark = None
-            return InventoryDecision(
-                action="HOLD",
-                reason="no_position",
-                target_quantity=Decimal("0"),
-                urgency=1,
-                reduce_fraction=0.0,
+            return self._record_decision(
+                unrealized_return=Decimal("0"),
+                decision=InventoryDecision(
+                    action="HOLD",
+                    reason="no_position",
+                    target_quantity=Decimal("0"),
+                    urgency=1,
+                    reduce_fraction=0.0,
+                ),
             )
 
         unrealized_return = (current_price - avg_entry) / avg_entry
         if self._high_water_mark is None or current_price > self._high_water_mark:
             self._high_water_mark = current_price
 
-        if self._high_water_mark is not None and unrealized_return >= Decimal(str(self.profit_levels[0][0])):
+        if self._high_water_mark is not None and adjusted_profit_levels:
+            first_profit_threshold = Decimal(str(adjusted_profit_levels[0][0]))
+        else:
+            first_profit_threshold = Decimal("0")
+        if self._high_water_mark is not None and unrealized_return >= first_profit_threshold:
             drawdown_from_high = (self._high_water_mark - current_price) / self._high_water_mark
-            if drawdown_from_high >= Decimal(str(self.trailing_stop_pct)):
-                return InventoryDecision(
-                    action="REDUCE_ALL",
-                    reason=f"inventory_trailing_stop_{self.trailing_stop_pct:.1%}",
-                    target_quantity=Decimal("0"),
-                    urgency=5,
-                    reduce_fraction=1.0,
+            if drawdown_from_high >= adjusted_trailing_stop:
+                return self._record_decision(
+                    unrealized_return=unrealized_return,
+                    decision=InventoryDecision(
+                        action="REDUCE_ALL",
+                        reason=f"inventory_trailing_stop_{float(adjusted_trailing_stop):.1%}",
+                        target_quantity=Decimal("0"),
+                        urgency=5,
+                        reduce_fraction=1.0,
+                    ),
                 )
 
-        for threshold, fraction in reversed(self.profit_levels):
+        for threshold, fraction in reversed(adjusted_profit_levels):
             if unrealized_return >= Decimal(str(threshold)):
                 reduce_fraction = max(0.0, min(1.0, float(fraction)))
                 reduce_qty = current_quantity * Decimal(str(reduce_fraction))
@@ -80,28 +123,88 @@ class InventoryManager:
                 action = "REDUCE_ALL" if reduce_fraction >= 0.999 else (
                     "REDUCE_50" if reduce_fraction >= 0.5 else "REDUCE_25"
                 )
-                return InventoryDecision(
-                    action=action,
-                    reason=f"inventory_profit_level_{threshold:.1%}",
-                    target_quantity=target_qty,
-                    urgency=4,
-                    reduce_fraction=reduce_fraction,
+                return self._record_decision(
+                    unrealized_return=unrealized_return,
+                    decision=InventoryDecision(
+                        action=action,
+                        reason=f"inventory_profit_level_{threshold:.1%}",
+                        target_quantity=target_qty,
+                        urgency=4,
+                        reduce_fraction=reduce_fraction,
+                    ),
                 )
 
-        if hours_in_position >= self.time_stop_hours and unrealized_return < Decimal(str(self.min_profit_for_time_stop)):
-            return InventoryDecision(
-                action="REDUCE_ALL",
-                reason=f"inventory_time_stop_{self.time_stop_hours}h",
-                target_quantity=Decimal("0"),
-                urgency=3,
-                reduce_fraction=1.0,
+        if (
+            hours_in_position >= adjusted_time_stop_hours
+            and unrealized_return < Decimal(str(self.min_profit_for_time_stop))
+        ):
+            return self._record_decision(
+                unrealized_return=unrealized_return,
+                decision=InventoryDecision(
+                    action="REDUCE_ALL",
+                    reason=f"inventory_time_stop_{adjusted_time_stop_hours}h",
+                    target_quantity=Decimal("0"),
+                    urgency=3,
+                    reduce_fraction=1.0,
+                ),
             )
 
-        return InventoryDecision(
-            action="HOLD",
-            reason="inventory_within_parameters",
-            target_quantity=current_quantity,
-            urgency=1,
-            reduce_fraction=0.0,
+        return self._record_decision(
+            unrealized_return=unrealized_return,
+            decision=InventoryDecision(
+                action="HOLD",
+                reason="inventory_within_parameters",
+                target_quantity=current_quantity,
+                urgency=1,
+                reduce_fraction=0.0,
+            ),
         )
 
+    def get_statistics(self) -> dict[str, float | int]:
+        """Return lightweight decision and realized-return statistics."""
+        decisions_total = sum(self._decision_counts.values())
+        reductions = sum(
+            count
+            for action, count in self._decision_counts.items()
+            if action.startswith("REDUCE") and action != "HOLD"
+        )
+        avg_exit_return = (
+            sum(self._recent_exit_returns) / len(self._recent_exit_returns)
+            if self._recent_exit_returns
+            else 0.0
+        )
+        best_exit = max(self._recent_exit_returns) if self._recent_exit_returns else 0.0
+        worst_exit = min(self._recent_exit_returns) if self._recent_exit_returns else 0.0
+        return {
+            "decisions_total": decisions_total,
+            "reductions_total": reductions,
+            "reduction_rate": (reductions / decisions_total) if decisions_total else 0.0,
+            "avg_exit_return": avg_exit_return,
+            "best_exit_return": best_exit,
+            "worst_exit_return": worst_exit,
+        }
+
+    def _adjust_profit_levels_for_volatility(self, volatility_percentile: float) -> tuple[tuple[float, float], ...]:
+        if not self.profit_levels:
+            return ()
+        # High volatility: lock partial profits earlier.
+        threshold_multiplier = 1.0 - (0.20 * volatility_percentile)
+        adjusted: list[tuple[float, float]] = []
+        for threshold, fraction in self.profit_levels:
+            new_threshold = max(0.0025, threshold * threshold_multiplier)
+            adjusted.append((new_threshold, fraction))
+        adjusted.sort(key=lambda item: item[0])
+        return tuple(adjusted)
+
+    def _record_decision(
+        self,
+        *,
+        unrealized_return: Decimal,
+        decision: InventoryDecision,
+    ) -> InventoryDecision:
+        self._decision_counts[decision.action] = self._decision_counts.get(decision.action, 0) + 1
+        if decision.action.startswith("REDUCE") and decision.reduce_fraction > 0:
+            self._recent_exit_returns.append(float(unrealized_return))
+            if len(self._recent_exit_returns) > self._max_exit_samples:
+                self._recent_exit_returns = self._recent_exit_returns[-self._max_exit_samples :]
+        return decision

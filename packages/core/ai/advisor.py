@@ -19,6 +19,8 @@ from packages.core.ai.multi_agent import MultiAgentCoordinator
 from packages.core.alternative_data import get_alternative_data_aggregator
 from packages.core.config import get_settings
 from packages.core.database.models import (
+    Approval,
+    ApprovalStatus,
     Candle,
     EquitySnapshot,
     EventLog,
@@ -69,22 +71,10 @@ class AIAdvisor:
 
         settings = get_settings()
         llm_settings = settings.llm
-        llm_proposals: list[AIProposal] = []
-        if llm_settings.enabled:
-            if settings.multiagent.enabled:
-                llm_proposals = await self._multi_agent_proposals(session, latest_metrics)
-            if not llm_proposals:
-                llm_proposals = await self._llm_proposals(session, latest_metrics)
-            if llm_proposals and llm_settings.prefer_llm:
-                max_items = max(1, min(llm_settings.max_proposals, settings.multiagent.max_proposals))
-                return llm_proposals[:max_items]
-            if not llm_proposals and not llm_settings.fallback_to_rules:
-                return []
-
-        proposals: list[AIProposal] = list(llm_proposals)
+        rule_based: list[AIProposal] = []
 
         if latest_metrics.max_drawdown >= 0.08:
-            proposals.append(
+            rule_based.append(
                 AIProposal(
                     title="Reduce risk_per_trade due to elevated drawdown",
                     proposal_type="risk_tuning",
@@ -105,7 +95,7 @@ class AIAdvisor:
 
         slippage_spike = await self._recent_slippage_spike(session)
         if slippage_spike is not None:
-            proposals.append(
+            rule_based.append(
                 AIProposal(
                     title="Increase slippage_bps safety margin",
                     proposal_type="execution_tuning",
@@ -120,11 +110,17 @@ class AIAdvisor:
 
         grid_tuning = self._grid_tuning_proposal(latest_metrics)
         if grid_tuning is not None:
-            proposals.append(grid_tuning)
+            rule_based.append(grid_tuning)
+
+        strategy_recommendations = await self._strategy_improvement_proposals(
+            session=session,
+            latest_metrics=latest_metrics,
+        )
+        rule_based.extend(strategy_recommendations)
 
         drl = await self._drl_proposal(session)
         if drl is not None:
-            proposals.append(
+            rule_based.append(
                 AIProposal(
                     title=drl.title,
                     proposal_type="drl_risk_tuning",
@@ -137,10 +133,76 @@ class AIAdvisor:
                 )
             )
 
+        llm_proposals: list[AIProposal] = []
+        if llm_settings.enabled:
+            if settings.multiagent.enabled:
+                llm_proposals = await self._multi_agent_proposals(session, latest_metrics)
+            if not llm_proposals:
+                llm_proposals = await self._llm_proposals(session, latest_metrics)
+            if not llm_proposals and not llm_settings.fallback_to_rules:
+                return []
+
+        if llm_settings.enabled and llm_settings.prefer_llm:
+            proposals = [*llm_proposals, *rule_based]
+        else:
+            proposals = [*rule_based, *llm_proposals]
+        proposals = self._dedupe_proposals(proposals)
+        proposals = await self._prune_recent_duplicates(session, proposals)
+
         if llm_settings.enabled:
             max_items = max(1, min(llm_settings.max_proposals, settings.multiagent.max_proposals))
             return proposals[:max_items]
-        return proposals
+        return proposals[: max(1, settings.multiagent.max_proposals)]
+
+    async def analyze_strategy(self, session: AsyncSession) -> dict[str, Any]:
+        """Return strategy diagnostics and AI recommendations for improvement."""
+        settings = get_settings()
+        latest_metrics = await self._latest_metrics(session)
+        if latest_metrics is None:
+            return {
+                "generated_at": datetime.now(UTC).isoformat(),
+                "active_strategy": settings.trading.active_strategy,
+                "symbol": settings.trading.pair,
+                "latest_metrics": None,
+                "strategy_insights": {},
+                "hold_diagnostics": {},
+                "regime_analysis": {},
+                "recommendations": [],
+            }
+
+        strategy_insights = await self._analyze_strategy_insights(session)
+        hold_diagnostics = await self._strategy_hold_diagnostics(session)
+        regime_analysis = await self._get_regime_context(session, symbol=settings.trading.pair)
+        recommendations = await self._strategy_improvement_proposals(
+            session=session,
+            latest_metrics=latest_metrics,
+            strategy_insights=strategy_insights,
+            hold_diagnostics=hold_diagnostics,
+            regime_analysis=regime_analysis,
+        )
+        recommendations = await self._prune_recent_duplicates(session, self._dedupe_proposals(recommendations))
+        return {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "active_strategy": settings.trading.active_strategy,
+            "symbol": settings.trading.pair,
+            "latest_metrics": {
+                "strategy_name": latest_metrics.strategy_name,
+                "total_trades": latest_metrics.total_trades,
+                "winning_trades": latest_metrics.winning_trades,
+                "losing_trades": latest_metrics.losing_trades,
+                "total_pnl": float(latest_metrics.total_pnl),
+                "total_fees": float(latest_metrics.total_fees),
+                "max_drawdown": latest_metrics.max_drawdown,
+                "win_rate": latest_metrics.win_rate,
+                "sharpe_ratio": latest_metrics.sharpe_ratio,
+                "sortino_ratio": latest_metrics.sortino_ratio,
+                "profit_factor": latest_metrics.profit_factor,
+            },
+            "strategy_insights": strategy_insights,
+            "hold_diagnostics": hold_diagnostics,
+            "regime_analysis": regime_analysis,
+            "recommendations": [self._proposal_payload(item) for item in recommendations],
+        }
 
     async def _latest_metrics(self, session: AsyncSession) -> MetricsSnapshot | None:
         result = await session.execute(
@@ -260,6 +322,7 @@ class AIAdvisor:
         market_context = await self._get_market_context(symbol=symbol)
         order_book_context = await self._get_order_book_context(symbol=symbol)
         strategy_insights = await self._analyze_strategy_insights(session)
+        hold_diagnostics = await self._strategy_hold_diagnostics(session)
         risk_metrics = self._build_risk_metrics(
             equity_values=equity_values,
             latest_metrics=latest_metrics,
@@ -336,6 +399,7 @@ class AIAdvisor:
             "risk_metrics": risk_metrics,
             "execution_metrics": execution_metrics,
             "strategy_insights": strategy_insights,
+            "hold_diagnostics": hold_diagnostics,
         }
 
     async def _analyze_trade_quality(self, session: AsyncSession) -> dict[str, Any]:
@@ -584,6 +648,204 @@ class AIAdvisor:
             "tp_hits": int(tp_hits_result.scalar_one_or_none() or 0),
         }
 
+    async def _strategy_hold_diagnostics(self, session: AsyncSession) -> dict[str, Any]:
+        since = datetime.now(UTC) - timedelta(hours=24)
+        signal_reason = func.json_extract(EventLog.details, "$.signal_reason")
+        hold_result = await session.execute(
+            select(signal_reason, func.count(EventLog.id))
+            .where(
+                EventLog.event_type == "risk_hold",
+                EventLog.created_at >= since,
+            )
+            .group_by(signal_reason)
+        )
+        reason_counts: dict[str, int] = {}
+        hold_total = 0
+        for reason, count in hold_result.all():
+            key = str(reason or "unknown")
+            value = int(count or 0)
+            reason_counts[key] = value
+            hold_total += value
+
+        order_result = await session.execute(
+            select(func.count(Order.id)).where(Order.created_at >= since)
+        )
+        order_count = int(order_result.scalar_one_or_none() or 0)
+        total_cycles = hold_total + order_count
+        hold_rate = float(hold_total / total_cycles) if total_cycles > 0 else 0.0
+        return {
+            "window_hours": 24,
+            "hold_count_24h": hold_total,
+            "order_count_24h": order_count,
+            "hold_rate_24h": hold_rate,
+            "reason_counts_24h": reason_counts,
+        }
+
+    async def _strategy_improvement_proposals(
+        self,
+        *,
+        session: AsyncSession,
+        latest_metrics: MetricsSnapshot,
+        strategy_insights: dict[str, Any] | None = None,
+        hold_diagnostics: dict[str, Any] | None = None,
+        regime_analysis: dict[str, Any] | None = None,
+    ) -> list[AIProposal]:
+        settings = get_settings()
+        active_strategy = settings.trading.active_strategy
+        symbol = settings.trading.pair
+
+        insights = strategy_insights or await self._analyze_strategy_insights(session)
+        holds = hold_diagnostics or await self._strategy_hold_diagnostics(session)
+        regime = regime_analysis or await self._get_regime_context(session, symbol=symbol)
+
+        reason_counts = holds.get("reason_counts_24h", {})
+        if not isinstance(reason_counts, dict):
+            reason_counts = {}
+        hold_rate = float(holds.get("hold_rate_24h", 0.0) or 0.0)
+        grid_wait_holds = int(reason_counts.get("grid_wait_inside_band", 0) or 0)
+        recenter_count = int(insights.get("recenter_count_30d", 0) or 0)
+        regime_name = str(regime.get("regime", "unknown"))
+        regime_confidence = float(regime.get("confidence", 0.0) or 0.0)
+        trend_strength = float(regime.get("trend_strength", 0.0) or 0.0)
+        latest_win_rate = float(latest_metrics.win_rate or 0.0)
+        latest_drawdown = float(latest_metrics.max_drawdown or 0.0)
+
+        recommendations: list[AIProposal] = []
+        if active_strategy == "smart_grid_ai":
+            if hold_rate >= 0.82 and grid_wait_holds >= 45:
+                tighter_min = max(12, settings.trading.grid_min_spacing_bps - 8)
+                tighter_max = max(tighter_min + 40, settings.trading.grid_max_spacing_bps - 30)
+                shorter_cooldown = max(30, settings.trading.grid_cooldown_seconds - 30)
+                recommendations.append(
+                    AIProposal(
+                        title="Increase smart-grid participation in low-activity regime",
+                        proposal_type="grid_tuning",
+                        description=(
+                            "High hold-rate suggests the strategy is waiting too often inside the active band. "
+                            "Tighten spacing and reduce cooldown modestly to increase trade participation."
+                        ),
+                        diff={
+                            "trading": {
+                                "grid_min_spacing_bps": tighter_min,
+                                "grid_max_spacing_bps": tighter_max,
+                                "grid_cooldown_seconds": shorter_cooldown,
+                            }
+                        },
+                        expected_impact=(
+                            "Higher fill probability with bounded increase in turnover."
+                        ),
+                        evidence={
+                            "hold_rate_24h": hold_rate,
+                            "grid_wait_holds_24h": grid_wait_holds,
+                            "order_count_24h": int(holds.get("order_count_24h", 0) or 0),
+                        },
+                        confidence=0.68,
+                        ttl_hours=self.ttl_hours,
+                    )
+                )
+
+            if recenter_count >= 100:
+                wider_min = min(500, settings.trading.grid_min_spacing_bps + 10)
+                wider_max = min(900, settings.trading.grid_max_spacing_bps + 60)
+                recenter_mode = (
+                    "conservative"
+                    if settings.trading.grid_recenter_mode == "aggressive"
+                    else settings.trading.grid_recenter_mode
+                )
+                recommendations.append(
+                    AIProposal(
+                        title="Reduce recenter churn in smart-grid",
+                        proposal_type="grid_tuning",
+                        description=(
+                            "Frequent recenter events indicate unstable band placement. "
+                            "Widen spacing and reduce recenter aggressiveness."
+                        ),
+                        diff={
+                            "trading": {
+                                "grid_min_spacing_bps": wider_min,
+                                "grid_max_spacing_bps": wider_max,
+                                "grid_recenter_mode": recenter_mode,
+                            }
+                        },
+                        expected_impact="Lower recenter churn and more stable grid behavior.",
+                        evidence={
+                            "recenter_count_30d": recenter_count,
+                            "regime": regime_name,
+                            "regime_confidence": regime_confidence,
+                        },
+                        confidence=0.66,
+                        ttl_hours=self.ttl_hours,
+                    )
+                )
+
+            if (
+                regime_name in {"trending_bullish", "trending_bearish"}
+                and regime_confidence >= 0.65
+                and trend_strength >= 0.55
+            ):
+                recommendations.append(
+                    AIProposal(
+                        title="Switch to trend strategy for persistent trend regime",
+                        proposal_type="strategy_switch",
+                        description=(
+                            "Detected persistent trend regime with high confidence. "
+                            "A trend strategy is likely better aligned than neutral grid."
+                        ),
+                        diff={"trading": {"active_strategy": "trend_ema_fast"}},
+                        expected_impact="Improved alignment with directional market phases.",
+                        evidence={
+                            "regime": regime_name,
+                            "regime_confidence": regime_confidence,
+                            "trend_strength": trend_strength,
+                            "active_strategy": active_strategy,
+                        },
+                        confidence=0.64,
+                        ttl_hours=self.ttl_hours,
+                    )
+                )
+        elif regime_name in {"ranging_tight", "ranging_wide"} and regime_confidence >= 0.60:
+            recommendations.append(
+                AIProposal(
+                    title="Switch to smart-grid for ranging regime",
+                    proposal_type="strategy_switch",
+                    description=(
+                        "Current strategy is not optimal for a ranging market. "
+                        "Switching to smart-grid can better capture mean reversion."
+                    ),
+                    diff={"trading": {"active_strategy": "smart_grid_ai"}},
+                    expected_impact="Better fit between strategy profile and current market regime.",
+                    evidence={
+                        "regime": regime_name,
+                        "regime_confidence": regime_confidence,
+                        "active_strategy": active_strategy,
+                    },
+                    confidence=0.63,
+                    ttl_hours=self.ttl_hours,
+                )
+            )
+        elif latest_drawdown >= 0.10 and latest_win_rate < 0.45:
+            recommendations.append(
+                AIProposal(
+                    title="Switch to smart-grid after weak trend performance",
+                    proposal_type="strategy_switch",
+                    description=(
+                        "Current strategy is underperforming with high drawdown and low win-rate. "
+                        "Switching to smart-grid can reduce directional dependence."
+                    ),
+                    diff={"trading": {"active_strategy": "smart_grid_ai"}},
+                    expected_impact="Improved robustness during mixed or low-trend conditions.",
+                    evidence={
+                        "max_drawdown": latest_drawdown,
+                        "win_rate": latest_win_rate,
+                        "active_strategy": active_strategy,
+                    },
+                    confidence=0.61,
+                    ttl_hours=self.ttl_hours,
+                )
+            )
+
+        return self._dedupe_proposals(recommendations)
+
     async def _generate_llm_raw_proposals(self, *, context: dict[str, Any]) -> list[dict[str, Any]]:
         return await get_llm_advisor_client().generate_proposals(context)
 
@@ -597,6 +859,14 @@ class AIAdvisor:
             "base_url": status.base_url,
             "prefer_llm": status.prefer_llm,
             "fallback_to_rules": status.fallback_to_rules,
+            "fallback_enabled": status.fallback_enabled,
+            "fallback_provider": status.fallback_provider,
+            "fallback_model": status.fallback_model,
+            "fallback_configured": status.fallback_configured,
+            "last_provider_used": status.last_provider_used,
+            "last_model_used": status.last_model_used,
+            "last_used_at": status.last_used_at,
+            "last_fallback_used": status.last_fallback_used,
             "last_error": status.last_error,
         }
 
@@ -671,6 +941,52 @@ class AIAdvisor:
             "agents_used": [agent.name for agent in coordinator.agents],
             "proposal_count": len(proposals),
         }
+
+    @staticmethod
+    def _proposal_payload(proposal: AIProposal) -> dict[str, Any]:
+        return {
+            "title": proposal.title,
+            "proposal_type": proposal.proposal_type,
+            "description": proposal.description,
+            "diff": proposal.diff,
+            "expected_impact": proposal.expected_impact,
+            "evidence": proposal.evidence,
+            "confidence": proposal.confidence,
+            "ttl_hours": proposal.ttl_hours,
+        }
+
+    @staticmethod
+    def _dedupe_proposals(proposals: list[AIProposal]) -> list[AIProposal]:
+        seen: set[tuple[str, str]] = set()
+        unique: list[AIProposal] = []
+        for proposal in proposals:
+            key = (proposal.proposal_type, proposal.title.strip().lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(proposal)
+        return unique
+
+    async def _prune_recent_duplicates(
+        self,
+        session: AsyncSession,
+        proposals: list[AIProposal],
+        *,
+        lookback_hours: int = 12,
+    ) -> list[AIProposal]:
+        if not proposals:
+            return []
+        cutoff = datetime.now(UTC) - timedelta(hours=max(1, lookback_hours))
+        result = await session.execute(
+            select(Approval.title)
+            .where(
+                Approval.created_at >= cutoff,
+                Approval.status.in_([ApprovalStatus.PENDING.value, ApprovalStatus.APPROVED.value]),
+            )
+            .limit(500)
+        )
+        recent_titles = {str(title).strip().lower() for title in result.scalars().all()}
+        return [proposal for proposal in proposals if proposal.title.strip().lower() not in recent_titles]
 
     def _sanitize_llm_proposals(
         self,

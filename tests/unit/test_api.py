@@ -344,6 +344,50 @@ class TestSystemEndpoints:
         mock_notifier.send_info.assert_awaited_once()
 
 
+class TestMarketEndpoints:
+    """Test market data/intelligence endpoints."""
+
+    def test_market_intelligence_endpoint(self):
+        """Intelligence endpoint returns context and order-book payload."""
+        client = TestClient(app)
+
+        class _FakeAggregator:
+            async def build_market_context(self, symbol: str):
+                from packages.core.alternative_data import MarketContext
+
+                return MarketContext(
+                    symbol=symbol,
+                    last_price=50000.0,
+                    change_24h=0.012,
+                    quote_volume_24h=1_500_000.0,
+                    fear_greed_index=55,
+                    funding_rate=0.0001,
+                )
+
+        class _FakeSpotAdapter:
+            async def get_order_book(self, symbol: str, limit: int = 20):
+                _ = (symbol, limit)
+                return {
+                    "bids": [["49990.00", "1.5"], ["49980.00", "2.0"]],
+                    "asks": [["50010.00", "1.2"], ["50020.00", "1.8"]],
+                }
+
+        with patch(
+            "packages.core.alternative_data.get_alternative_data_aggregator",
+            return_value=_FakeAggregator(),
+        ), patch(
+            "packages.adapters.binance_spot.get_binance_adapter",
+            return_value=_FakeSpotAdapter(),
+        ):
+            response = client.get("/api/market/intelligence?symbol=BTCUSDT&timeframe=1h&lookback=120")
+
+        assert response.status_code == 200
+        payload = response.json()
+        assert payload["symbol"] == "BTCUSDT"
+        assert payload["context"]["fear_greed"] == 55
+        assert payload["order_book"] is None or "spread_bps" in payload["order_book"]
+
+
 class TestTradingEndpoints:
     """Test trading endpoints."""
 
@@ -809,6 +853,42 @@ class TestAIEndpoints:
         assert data["ok"] is True
         assert data["proposal_count"] == 2
 
+    def test_strategy_analysis_endpoint(self):
+        """Strategy analysis endpoint returns diagnostics and recommendations."""
+        client = TestClient(app)
+        mock_advisor = Mock()
+        mock_advisor.analyze_strategy = AsyncMock(
+            return_value={
+                "generated_at": "2026-02-11T00:00:00+00:00",
+                "active_strategy": "smart_grid_ai",
+                "symbol": "BTCUSDT",
+                "latest_metrics": {"total_trades": 120, "win_rate": 0.52},
+                "strategy_insights": {"recenter_count_30d": 12},
+                "hold_diagnostics": {"hold_rate_24h": 0.81},
+                "regime_analysis": {"regime": "ranging_wide", "confidence": 0.64},
+                "recommendations": [
+                    {
+                        "title": "Increase smart-grid participation in low-activity regime",
+                        "proposal_type": "grid_tuning",
+                        "description": "Tune spacing and cooldown.",
+                        "diff": {"trading": {"grid_min_spacing_bps": 24}},
+                        "expected_impact": "Higher participation",
+                        "evidence": {"hold_rate_24h": 0.81},
+                        "confidence": 0.68,
+                        "ttl_hours": 2,
+                    }
+                ],
+            }
+        )
+        with patch("apps.api.routers.ai.get_ai_advisor", return_value=mock_advisor):
+            response = client.get("/api/ai/strategy/analysis")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["active_strategy"] == "smart_grid_ai"
+        assert data["symbol"] == "BTCUSDT"
+        assert isinstance(data["recommendations"], list)
+        assert data["recommendations"][0]["proposal_type"] == "grid_tuning"
+
     def test_optimizer_endpoints_require_data(self):
         """Optimizer endpoints reject when insufficient data."""
         client = TestClient(app)
@@ -893,6 +973,40 @@ class TestAIEndpoints:
         assert response.status_code == 200
         payload = response.json()
         assert "found" in payload
+
+    def test_emergency_ai_settings_endpoints(self):
+        """Emergency AI runtime settings can be queried and updated."""
+        client = TestClient(app)
+        before = client.get("/api/ai/emergency/settings")
+        assert before.status_code == 200
+        assert "enabled" in before.json()
+        assert "max_proposals" in before.json()
+
+        updated = client.post(
+            "/api/ai/emergency/settings",
+            json={
+                "enabled": False,
+                "max_proposals": 4,
+                "reason": "test_settings_update",
+                "changed_by": "tester",
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["enabled"] is False
+        assert updated.json()["max_proposals"] == 4
+
+        reset = client.post(
+            "/api/ai/emergency/settings",
+            json={
+                "enabled": True,
+                "max_proposals": 3,
+                "reason": "test_settings_reset",
+                "changed_by": "tester",
+            },
+        )
+        assert reset.status_code == 200
+        assert reset.json()["enabled"] is True
+        assert reset.json()["max_proposals"] == 3
 
     def test_auto_approve_enable_sweeps_pending_approvals(self, monkeypatch):
         """Enabling auto-approve should immediately process existing pending proposals."""

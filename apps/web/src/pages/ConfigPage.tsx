@@ -25,6 +25,8 @@ export function ConfigPage() {
           <p>Paper Starting Equity: {formatNumber(config?.paper_starting_equity ?? 0, 2)} USDT</p>
           <p>Approval Timeout: {config?.approval_timeout_hours ?? "-"} hours</p>
           <p>Auto-Approve AI Suggestions: {String(config?.approval_auto_approve_enabled ?? false)}</p>
+          <p>Emergency AI Supervisor Enabled: {String(config?.approval_emergency_ai_enabled ?? false)}</p>
+          <p>Emergency AI Max Proposals: {config?.approval_emergency_max_proposals ?? "-"}</p>
         </div>
       </article>
       <article className="rounded-2xl border border-white/10 bg-white/5 p-4 shadow-panel backdrop-blur">

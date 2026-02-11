@@ -227,10 +227,97 @@ export type TradingConfig = {
   slippage_bps: number;
   approval_timeout_hours: number;
   approval_auto_approve_enabled: boolean;
+  approval_emergency_ai_enabled: boolean;
+  approval_emergency_max_proposals: number;
   multiagent_enabled: boolean;
   multiagent_max_proposals: number;
   multiagent_min_confidence: number;
   multiagent_meta_agent_enabled: boolean;
+};
+
+export type MarketIntelligence = {
+  symbol: string;
+  timeframe: string;
+  candles_used: number;
+  generated_at: string;
+  context: {
+    symbol: string;
+    last_price: number;
+    change_24h: number;
+    volume_24h: number;
+    fear_greed: number;
+    funding_rate: number;
+  };
+  order_book: {
+    best_bid: number;
+    best_ask: number;
+    spread_bps: number;
+    bid_depth_10: number;
+    ask_depth_10: number;
+    imbalance: number;
+    liquidity_score: number;
+    market_impact_1btc_bps: number;
+  } | null;
+  regime: {
+    regime: string;
+    confidence: number;
+    trend_strength: number;
+    volatility_percentile: number;
+    mean_reversion_factor: number;
+    breakout_probability: number;
+    persistence_score: number;
+    transition_probabilities: Record<string, number>;
+    indicators: Record<string, number>;
+  } | null;
+};
+
+export type EmergencyAnalyzeResponse = {
+  triggered: boolean;
+  source: string;
+  reason: string;
+  used_llm: boolean;
+  llm_error: string | null;
+  proposals_generated: number;
+  approvals_created: number;
+  approvals_auto_approved: number;
+  proposal_titles: string[];
+  approval_ids: number[];
+};
+
+export type EmergencyAnalysisStatus = {
+  found: boolean;
+  event_type: string | null;
+  summary: string | null;
+  details: Record<string, unknown> | null;
+  created_at: string | null;
+  actor: string | null;
+};
+
+export type EmergencyAISettings = {
+  enabled: boolean;
+  max_proposals: number;
+};
+
+export type StrategyRecommendation = {
+  title: string;
+  proposal_type: string;
+  description: string;
+  diff: Record<string, unknown>;
+  expected_impact: string;
+  evidence: Record<string, unknown>;
+  confidence: number;
+  ttl_hours: number;
+};
+
+export type StrategyAnalysis = {
+  generated_at: string;
+  active_strategy: string;
+  symbol: string;
+  latest_metrics: Record<string, unknown> | null;
+  strategy_insights: Record<string, unknown>;
+  hold_diagnostics: Record<string, unknown>;
+  regime_analysis: Record<string, unknown>;
+  recommendations: StrategyRecommendation[];
 };
 
 export type Order = {
@@ -329,6 +416,25 @@ export type MultiAgentStatus = {
   market_agent_enabled: boolean;
   execution_agent_enabled: boolean;
   sentiment_agent_enabled: boolean;
+};
+
+export type LLMStatus = {
+  enabled: boolean;
+  provider: string;
+  model: string;
+  configured: boolean;
+  base_url: string | null;
+  prefer_llm: boolean;
+  fallback_to_rules: boolean;
+  fallback_enabled: boolean;
+  fallback_provider: string;
+  fallback_model: string;
+  fallback_configured: boolean;
+  last_provider_used: string | null;
+  last_model_used: string | null;
+  last_used_at: string | null;
+  last_fallback_used: boolean | null;
+  last_error: string | null;
 };
 
 export type MultiAgentTestResult = {
@@ -533,6 +639,10 @@ export const api = {
     fetchJson<MarketPrice>(`/api/market/price${buildQuery({ symbol })}`),
   getMarketCandles: (symbol: string, timeframe = "1h", limit = 120) =>
     fetchJson<MarketCandle[]>(`/api/market/candles${buildQuery({ symbol, timeframe, limit })}`),
+  getMarketIntelligence: (symbol: string, timeframe = "1h", lookback = 240) =>
+    fetchJson<MarketIntelligence>(
+      `/api/market/intelligence${buildQuery({ symbol, timeframe, lookback })}`,
+    ),
   listApprovals: (status?: string, limit = 100) =>
     fetchJson<Approval[]>(`/api/ai/approvals${buildQuery({ status, limit })}`),
   getAutoApproveStatus: () => fetchJson<AutoApproveStatus>("/api/ai/auto-approve"),
@@ -541,6 +651,44 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ enabled, reason, changed_by: "web_dashboard" }),
     }),
+  getEmergencyAISettings: () =>
+    fetchJson<EmergencyAISettings>("/api/ai/emergency/settings"),
+  setEmergencyAISettings: (
+    payload: {
+      enabled?: boolean;
+      max_proposals?: number;
+      reason?: string;
+    },
+  ) =>
+    fetchJson<EmergencyAISettings>("/api/ai/emergency/settings", {
+      method: "POST",
+      body: JSON.stringify({
+        enabled: payload.enabled,
+        max_proposals: payload.max_proposals,
+        reason: payload.reason ?? "dashboard_toggle",
+        changed_by: "web_dashboard",
+      }),
+    }),
+  analyzeEmergencyNow: (payload: {
+    reason?: string;
+    source?: string;
+    metadata?: Record<string, unknown>;
+    force?: boolean;
+  }) =>
+    fetchJson<EmergencyAnalyzeResponse>("/api/ai/emergency/analyze-now", {
+      method: "POST",
+      body: JSON.stringify({
+        reason: payload.reason,
+        source: payload.source ?? "web_manual_emergency_analysis",
+        metadata: payload.metadata ?? {},
+        force: payload.force ?? false,
+      }),
+    }),
+  getLastEmergencyAnalysis: () =>
+    fetchJson<EmergencyAnalysisStatus>("/api/ai/emergency/last-analysis"),
+  getStrategyAnalysis: () =>
+    fetchJson<StrategyAnalysis>("/api/ai/strategy/analysis"),
+  getLLMStatus: () => fetchJson<LLMStatus>("/api/ai/llm/status"),
   getMultiAgentStatus: () => fetchJson<MultiAgentStatus>("/api/ai/multi-agent/status"),
   testMultiAgent: () =>
     fetchJson<MultiAgentTestResult>("/api/ai/multi-agent/test", {

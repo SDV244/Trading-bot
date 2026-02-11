@@ -46,6 +46,7 @@ def reset_singletons() -> None:
 @pytest.fixture(autouse=True)
 def reset_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     """Ensure strategy-related settings are deterministic."""
+    monkeypatch.setenv("TRADING_LIVE_MODE", "false")
     monkeypatch.setenv("TRADING_ACTIVE_STRATEGY", "trend_ema")
     monkeypatch.setenv("TRADING_REQUIRE_DATA_READY", "true")
     monkeypatch.setenv("TRADING_SPOT_POSITION_MODE", "long_flat")

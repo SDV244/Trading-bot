@@ -38,3 +38,20 @@ def test_detects_volatile_regime_on_large_swings() -> None:
     assert analysis.regime in {MarketRegime.VOLATILE_CHAOS, MarketRegime.RANGING_WIDE}
     assert analysis.volatility_percentile >= 0.5
 
+
+def test_transition_probability_and_persistence_scores() -> None:
+    detector = MarketRegimeDetector()
+    closes = _series(100.0, 0.2, 240)
+    highs = [price * Decimal("1.006") for price in closes]
+    lows = [price * Decimal("0.994") for price in closes]
+    volumes = [Decimal("1200") for _ in closes]
+
+    analysis_first = detector.detect_regime(closes=closes, volumes=volumes, highs=highs, lows=lows)
+    analysis_second = detector.detect_regime(closes=closes, volumes=volumes, highs=highs, lows=lows)
+
+    probs = detector.get_regime_transition_probability(analysis_second.regime)
+    persistence = detector.get_regime_persistence_score(analysis_second.regime)
+
+    assert analysis_first.regime in probs
+    assert 0.0 <= persistence <= 1.0
+    assert abs(sum(probs.values()) - 1.0) < 1e-6

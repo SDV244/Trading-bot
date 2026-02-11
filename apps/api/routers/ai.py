@@ -1,6 +1,6 @@
 """AI approval and audit endpoints."""
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -115,6 +115,14 @@ class LLMStatusResponse(BaseModel):
     base_url: str | None
     prefer_llm: bool
     fallback_to_rules: bool
+    fallback_enabled: bool
+    fallback_provider: str
+    fallback_model: str
+    fallback_configured: bool
+    last_provider_used: str | None
+    last_model_used: str | None
+    last_used_at: datetime | None
+    last_fallback_used: bool | None
     last_error: str | None
 
 
@@ -189,6 +197,48 @@ class EmergencyAnalysisStatusResponse(BaseModel):
     details: dict[str, Any] | None
     created_at: datetime | None
     actor: str | None
+
+
+class EmergencyAISettingsResponse(BaseModel):
+    """Emergency-stop AI runtime configuration status."""
+
+    enabled: bool
+    max_proposals: int
+
+
+class EmergencyAISettingsUpdateRequest(BaseModel):
+    """Update request for emergency-stop AI runtime settings."""
+
+    enabled: bool | None = None
+    max_proposals: int | None = Field(default=None, ge=1, le=10)
+    reason: str = Field(default="dashboard_toggle")
+    changed_by: str = Field(default="web_dashboard")
+
+
+class StrategyRecommendationResponse(BaseModel):
+    """Strategy improvement recommendation preview."""
+
+    title: str
+    proposal_type: str
+    description: str
+    diff: dict[str, Any]
+    expected_impact: str
+    evidence: dict[str, Any]
+    confidence: float
+    ttl_hours: int
+
+
+class StrategyAnalysisResponse(BaseModel):
+    """AI strategy diagnostics and improvement recommendations."""
+
+    generated_at: datetime
+    active_strategy: str
+    symbol: str
+    latest_metrics: dict[str, Any] | None
+    strategy_insights: dict[str, Any]
+    hold_diagnostics: dict[str, Any]
+    regime_analysis: dict[str, Any]
+    recommendations: list[StrategyRecommendationResponse]
 
 
 def _to_approval_response(approval: Approval) -> ApprovalResponse:
@@ -268,6 +318,65 @@ async def test_multiagent_connection(
     return MultiAgentTestResponse(**result)
 
 
+@router.get("/strategy/analysis", response_model=StrategyAnalysisResponse)
+async def get_strategy_analysis(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> StrategyAnalysisResponse:
+    """Get strategy diagnostics and AI recommendations for improvement."""
+    await init_database()
+    async with get_session() as session:
+        analysis = await get_ai_advisor().analyze_strategy(session)
+
+    generated_raw = analysis.get("generated_at")
+    generated_at = datetime.now(UTC)
+    if isinstance(generated_raw, datetime):
+        generated_at = generated_raw
+    elif isinstance(generated_raw, str):
+        try:
+            parsed = datetime.fromisoformat(generated_raw.replace("Z", "+00:00"))
+            generated_at = parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+        except ValueError:
+            generated_at = datetime.now(UTC)
+
+    raw_recommendations = analysis.get("recommendations", [])
+    recommendations: list[StrategyRecommendationResponse] = []
+    if isinstance(raw_recommendations, list):
+        for item in raw_recommendations:
+            if not isinstance(item, dict):
+                continue
+            recommendations.append(
+                StrategyRecommendationResponse(
+                    title=str(item.get("title", "")),
+                    proposal_type=str(item.get("proposal_type", "")),
+                    description=str(item.get("description", "")),
+                    diff=item.get("diff", {}) if isinstance(item.get("diff"), dict) else {},
+                    expected_impact=str(item.get("expected_impact", "")),
+                    evidence=item.get("evidence", {}) if isinstance(item.get("evidence"), dict) else {},
+                    confidence=float(item.get("confidence", 0.0) or 0.0),
+                    ttl_hours=int(item.get("ttl_hours", 2) or 2),
+                )
+            )
+
+    return StrategyAnalysisResponse(
+        generated_at=generated_at,
+        active_strategy=str(analysis.get("active_strategy", "")),
+        symbol=str(analysis.get("symbol", "")),
+        latest_metrics=analysis.get("latest_metrics")
+        if isinstance(analysis.get("latest_metrics"), dict) or analysis.get("latest_metrics") is None
+        else None,
+        strategy_insights=analysis.get("strategy_insights", {})
+        if isinstance(analysis.get("strategy_insights"), dict)
+        else {},
+        hold_diagnostics=analysis.get("hold_diagnostics", {})
+        if isinstance(analysis.get("hold_diagnostics"), dict)
+        else {},
+        regime_analysis=analysis.get("regime_analysis", {})
+        if isinstance(analysis.get("regime_analysis"), dict)
+        else {},
+        recommendations=recommendations,
+    )
+
+
 @router.get("/auto-approve", response_model=AutoApproveStatusResponse)
 async def get_auto_approve_status(
     _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
@@ -277,6 +386,53 @@ async def get_auto_approve_status(
     return AutoApproveStatusResponse(
         enabled=settings.approval.auto_approve_enabled,
         decided_by="ai_auto_approver",
+    )
+
+
+@router.get("/emergency/settings", response_model=EmergencyAISettingsResponse)
+async def get_emergency_ai_settings(
+    _: AuthUser = Depends(require_min_role(AuthRole.VIEWER)),
+) -> EmergencyAISettingsResponse:
+    """Get emergency-stop AI runtime settings."""
+    settings = get_settings()
+    return EmergencyAISettingsResponse(
+        enabled=settings.approval.emergency_ai_enabled,
+        max_proposals=settings.approval.emergency_max_proposals,
+    )
+
+
+@router.post("/emergency/settings", response_model=EmergencyAISettingsResponse)
+async def update_emergency_ai_settings(
+    request: EmergencyAISettingsUpdateRequest,
+    user: AuthUser = Depends(require_min_role(AuthRole.OPERATOR)),
+) -> EmergencyAISettingsResponse:
+    """Update emergency-stop AI runtime settings."""
+    await init_database()
+    patch: dict[str, Any] = {"approval": {}}
+    if request.enabled is not None:
+        patch["approval"]["emergency_ai_enabled"] = request.enabled
+    if request.max_proposals is not None:
+        patch["approval"]["emergency_max_proposals"] = request.max_proposals
+    applied = apply_runtime_config_patch(patch)
+
+    async with get_session() as session:
+        await log_event(
+            session,
+            event_type="ai_emergency_settings_updated",
+            event_category="config",
+            summary="Emergency AI settings updated",
+            details={
+                "enabled": get_settings().approval.emergency_ai_enabled,
+                "max_proposals": get_settings().approval.emergency_max_proposals,
+                "reason": request.reason,
+                "applied_keys": applied.get("approval", []),
+            },
+            actor=request.changed_by or user.username,
+        )
+    settings = get_settings()
+    return EmergencyAISettingsResponse(
+        enabled=settings.approval.emergency_ai_enabled,
+        max_proposals=settings.approval.emergency_max_proposals,
     )
 
 

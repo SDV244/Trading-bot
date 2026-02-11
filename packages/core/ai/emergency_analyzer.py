@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -94,7 +95,7 @@ class EmergencyStopAnalyzer:
                     proposals = self._sanitize_llm_proposals(raw)
                     used_llm = True
                 except Exception as exc:  # noqa: BLE001
-                    llm_error = str(exc)
+                    llm_error = _sanitize_error_text(str(exc))
 
             if not proposals:
                 proposals = self._build_fallback_proposals(
@@ -161,7 +162,7 @@ class EmergencyStopAnalyzer:
                 event_type="emergency_ai_analysis_failed",
                 event_category="ai",
                 summary=f"Emergency AI analysis failed ({source})",
-                details={"source": source, "reason": reason, "error": str(exc)},
+                details={"source": source, "reason": reason, "error": _sanitize_error_text(str(exc))},
                 actor=actor,
             )
             return EmergencyAnalysisOutcome(
@@ -169,7 +170,7 @@ class EmergencyStopAnalyzer:
                 source=source,
                 reason=reason,
                 used_llm=used_llm,
-                llm_error=llm_error or str(exc),
+                llm_error=llm_error or _sanitize_error_text(str(exc)),
                 proposals_generated=0,
                 approvals_created=0,
                 approvals_auto_approved=0,
@@ -554,6 +555,26 @@ def _safe_confidence(raw: Any) -> float:
     if value > 1.0:
         return 1.0
     return value
+
+
+def _sanitize_error_text(value: str) -> str:
+    """Redact API keys/tokens that might leak through provider error messages."""
+    redacted = value
+    redacted = re.sub(r"([?&]key=)[^&\s]+", r"\1REDACTED", redacted, flags=re.IGNORECASE)
+    redacted = re.sub(r"(api[_-]?key\"?\s*[:=]\s*\"?)[A-Za-z0-9_\-]+", r"\1REDACTED", redacted, flags=re.IGNORECASE)
+    redacted = re.sub(
+        r"(api[_-]?secret\"?\s*[:=]\s*\"?)[A-Za-z0-9_\-]+",
+        r"\1REDACTED",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    redacted = re.sub(
+        r"(authorization\s*[:=]\s*bearer\s+)[^\s\"']+",
+        r"\1REDACTED",
+        redacted,
+        flags=re.IGNORECASE,
+    )
+    return redacted
 
 
 def _emergency_system_prompt() -> str:

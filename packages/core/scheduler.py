@@ -69,6 +69,7 @@ class TradingScheduler:
         self._last_heartbeat_at: datetime | None = None
         self._last_trade_summary_at: datetime | None = None
         self._last_daily_wrap_at: datetime | None = None
+        self._last_strategy_digest_at: datetime | None = None
         self._last_cycle_started_monotonic: float | None = None
         set_scheduler_running(False)
 
@@ -226,6 +227,7 @@ class TradingScheduler:
                 )
                 await self._maybe_send_heartbeat()
                 await self._maybe_send_trade_summaries()
+                await self._maybe_send_strategy_digest()
             except Exception as e:
                 self._last_error = str(e)
                 logger.exception("Trading scheduler cycle failed")
@@ -342,6 +344,72 @@ class TradingScheduler:
                             f"equity={payload['equity']}"
                         ),
                     )
+
+    async def _maybe_send_strategy_digest(self) -> None:
+        """Send periodic AI strategy diagnostics and top recommendations."""
+        notifier = get_telegram_notifier()
+        if not notifier.enabled:
+            return
+
+        now = datetime.now(UTC)
+        interval_hours = 6
+        if self._last_strategy_digest_at is None:
+            self._last_strategy_digest_at = now
+            return
+
+        elapsed_hours = (now - self._last_strategy_digest_at).total_seconds() / 3600
+        if elapsed_hours < interval_hours:
+            return
+
+        async with get_session() as session:
+            analysis = await get_ai_advisor().analyze_strategy(session)
+
+        recommendations = analysis.get("recommendations", [])
+        top_recommendations = recommendations[:3]
+        active_strategy = str(analysis.get("active_strategy", "unknown"))
+        symbol = str(analysis.get("symbol", "unknown"))
+        regime_info = analysis.get("regime_analysis", {})
+        regime_label = str(regime_info.get("label", "unknown")) if isinstance(regime_info, dict) else "unknown"
+        hold_diagnostics = analysis.get("hold_diagnostics", {})
+        hold_reason = (
+            str(hold_diagnostics.get("primary_reason", "none"))
+            if isinstance(hold_diagnostics, dict)
+            else "none"
+        )
+
+        if top_recommendations:
+            recommendation_lines: list[str] = []
+            for idx, item in enumerate(top_recommendations, start=1):
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", "Untitled recommendation"))
+                confidence = float(item.get("confidence", 0.0))
+                recommendation_lines.append(f"{idx}. {title} (conf={confidence:.2f})")
+            recommendation_text = "\n".join(recommendation_lines) if recommendation_lines else "No actionable recommendation."
+        else:
+            recommendation_text = "No actionable recommendation."
+
+        body = (
+            f"Symbol: {symbol}\n"
+            f"Strategy: {active_strategy}\n"
+            f"Regime: {regime_label}\n"
+            f"Primary hold reason: {hold_reason}\n"
+            "Top recommendations:\n"
+            f"{recommendation_text}"
+        )
+        sent = await notifier.send_info(f"{interval_hours}h strategy digest", body)
+        if sent:
+            self._last_strategy_digest_at = now
+
+        await get_webhook_notifier().send_info(
+            f"{interval_hours}h strategy digest",
+            (
+                f"strategy={active_strategy} "
+                f"symbol={symbol} "
+                f"regime={regime_label} "
+                f"recommendations={len(top_recommendations)}"
+            ),
+        )
 
     async def _build_trade_summary_window(self, window_hours: int) -> tuple[str, dict[str, str | int]]:
         now = datetime.now(UTC)

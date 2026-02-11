@@ -9,6 +9,7 @@ import { ChartPage } from "./pages/ChartPage";
 import { ConfigPage } from "./pages/ConfigPage";
 import { ControlsPage } from "./pages/ControlsPage";
 import { HomePage } from "./pages/HomePage";
+import { IntelligencePage } from "./pages/IntelligencePage";
 import { LoginPage } from "./pages/LoginPage";
 import { LogsPage } from "./pages/LogsPage";
 import { TradingPage } from "./pages/TradingPage";
@@ -30,6 +31,14 @@ function AppRoutes() {
       >
         <Route index element={<HomePage />} />
         <Route path="trading" element={<TradingPage />} />
+        <Route
+          path="intelligence"
+          element={
+            <ProtectedRoute minRole="operator">
+              <IntelligencePage />
+            </ProtectedRoute>
+          }
+        />
         <Route path="chart" element={<ChartPage />} />
         <Route path="config" element={<ConfigPage />} />
         <Route

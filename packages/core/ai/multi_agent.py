@@ -16,30 +16,12 @@ _AGENT_SCHEMA = {
             "title": "string",
             "proposal_type": "risk_tuning|execution_tuning|grid_tuning|strategy_switch|anomaly_alert",
             "description": "string",
-            "diff": {
-                "risk": {
-                    "per_trade": "number",
-                    "max_daily_loss": "number",
-                    "max_exposure": "number",
-                    "fee_bps": "integer",
-                    "slippage_bps": "integer",
-                },
-                "trading": {
-                    "active_strategy": "string",
-                    "grid_levels": "integer",
-                    "grid_min_spacing_bps": "integer",
-                    "grid_max_spacing_bps": "integer",
-                    "grid_volatility_blend": "number",
-                    "grid_trend_tilt": "number",
-                    "grid_take_profit_buffer": "number",
-                    "grid_stop_loss_buffer": "number",
-                    "grid_recenter_mode": "aggressive|conservative",
-                },
-            },
+            "diff": {"risk": {"key": "value"}, "trading": {"key": "value"}},
             "expected_impact": "string",
             "evidence": {"key": "value"},
             "confidence": "0.0-1.0",
             "priority": "1-5",
+            "reasoning": "string",
         }
     ]
 }
@@ -415,6 +397,7 @@ class MultiAgentCoordinator:
         self.enabled = settings.enabled
         self.max_proposals = settings.max_proposals
         self.min_confidence = settings.min_confidence
+        self.agent_timeout_seconds = settings.agent_timeout_seconds
         self.use_meta_agent = settings.meta_agent_enabled
 
         self.agents: list[BaseAgent] = []
@@ -437,11 +420,33 @@ class MultiAgentCoordinator:
     ) -> list[AgentProposal]:
         if not self.enabled or not self.agents:
             return []
-        tasks = [
-            asyncio.create_task(agent.analyze(context=context, llm_client=llm_client))
-            for agent in self.agents
-        ]
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        # Local Ollama instances can stall under parallel generation; run sequentially for stability.
+        settings = get_settings()
+        run_sequential = settings.llm.provider == "ollama"
+        gathered: list[list[AgentProposal] | BaseException]
+        if run_sequential:
+            gathered = []
+            for agent in self.agents:
+                try:
+                    gathered.append(
+                        await asyncio.wait_for(
+                            agent.analyze(context=context, llm_client=llm_client),
+                            timeout=self.agent_timeout_seconds,
+                        )
+                    )
+                except Exception as exc:
+                    gathered.append(exc)
+        else:
+            tasks = [
+                asyncio.create_task(
+                    asyncio.wait_for(
+                        agent.analyze(context=context, llm_client=llm_client),
+                        timeout=self.agent_timeout_seconds,
+                    )
+                )
+                for agent in self.agents
+            ]
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
         collected: list[AgentProposal] = []
         for payload in gathered:

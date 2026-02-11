@@ -2,6 +2,7 @@
 
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 from sqlalchemy import select
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import packages.core.state as state_module
 from packages.core.ai import AIAdvisor, ApprovalGate
 from packages.core.ai.advisor import AIProposal
+from packages.core.ai.emergency_analyzer import EmergencyStopAnalyzer
 from packages.core.config import get_settings, reload_settings
 from packages.core.database.models import Approval, Base, Config, EventLog, MetricsSnapshot
 
@@ -412,4 +414,84 @@ async def test_advisor_prefers_multiagent_when_enabled(
     assert len(proposals) == 1
     assert "Multi-agent tune" in proposals[0].title
     assert proposals[0].diff["trading"]["grid_min_spacing_bps"] == 42
+    reload_settings()
+
+
+@pytest.mark.asyncio
+async def test_strategy_analysis_returns_grid_improvement_recommendation(db_session: AsyncSession) -> None:
+    db_session.add(
+        MetricsSnapshot(
+            strategy_name="smart_grid_ai",
+            total_trades=200,
+            winning_trades=98,
+            losing_trades=102,
+            total_pnl=Decimal("24"),
+            total_fees=Decimal("18"),
+            max_drawdown=0.06,
+            sharpe_ratio=0.9,
+            sortino_ratio=1.1,
+            profit_factor=1.05,
+            win_rate=0.49,
+            avg_trade_pnl=Decimal("0.12"),
+            is_paper=True,
+        )
+    )
+    for idx in range(80):
+        db_session.add(
+            EventLog(
+                event_type="risk_hold",
+                event_category="risk",
+                summary="Signal blocked by risk engine: signal_hold",
+                details={"signal_reason": "grid_wait_inside_band", "risk_reason": "signal_hold"},
+                config_version=1,
+                actor="system",
+                created_at=datetime.now(UTC) - timedelta(minutes=idx),
+            )
+        )
+    await db_session.flush()
+
+    advisor = AIAdvisor()
+    analysis = await advisor.analyze_strategy(db_session)
+
+    assert analysis["active_strategy"] == "smart_grid_ai"
+    assert analysis["hold_diagnostics"]["hold_rate_24h"] > 0.8
+    assert any(
+        rec["proposal_type"] == "grid_tuning"
+        and rec["title"] == "Increase smart-grid participation in low-activity regime"
+        for rec in analysis["recommendations"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_emergency_analyzer_redacts_llm_keys_in_errors(
+    db_session: AsyncSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LLM_ENABLED", "true")
+    reload_settings()
+
+    analyzer = EmergencyStopAnalyzer()
+
+    class _FakeClient:
+        async def generate_structured(self, **_kwargs):
+            raise RuntimeError(
+                "Client error '429 Too Many Requests' for url "
+                "'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+                "?key=THIS_SHOULD_NOT_LEAK'"
+            )
+
+    with patch("packages.core.ai.emergency_analyzer.get_llm_advisor_client", return_value=_FakeClient()):
+        outcome = await analyzer.analyze_and_enqueue(
+            db_session,
+            reason="manual_verification",
+            source="unit_test",
+            metadata={},
+            actor="tester",
+            force=True,
+        )
+
+    assert outcome.triggered is True
+    assert outcome.llm_error is not None
+    assert "THIS_SHOULD_NOT_LEAK" not in outcome.llm_error
+    assert "key=REDACTED" in outcome.llm_error
     reload_settings()

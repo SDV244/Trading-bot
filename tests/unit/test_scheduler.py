@@ -127,3 +127,44 @@ async def test_scheduler_sends_periodic_trade_summary(monkeypatch: pytest.Monkey
         await scheduler._maybe_send_trade_summaries()
 
     mock_notifier.send_info.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_sends_periodic_strategy_digest() -> None:
+    """Scheduler should emit strategy digest when 6h interval elapses."""
+    scheduler = TradingScheduler(interval_seconds=60)
+    scheduler._last_strategy_digest_at = datetime.now(UTC) - timedelta(hours=7)
+
+    mock_notifier = AsyncMock()
+    mock_notifier.enabled = True
+    mock_notifier.send_info = AsyncMock(return_value=True)
+
+    mock_webhook = AsyncMock()
+    mock_webhook.send_info = AsyncMock(return_value=True)
+
+    mock_advisor = AsyncMock()
+    mock_advisor.analyze_strategy = AsyncMock(
+        return_value={
+            "active_strategy": "smart_grid",
+            "symbol": "BTCUSDT",
+            "regime_analysis": {"label": "ranging"},
+            "hold_diagnostics": {"primary_reason": "signal_hold"},
+            "recommendations": [
+                {"title": "Increase spacing", "confidence": 0.82},
+                {"title": "Reduce size", "confidence": 0.74},
+            ],
+        }
+    )
+
+    with (
+        patch("packages.core.scheduler.get_telegram_notifier", return_value=mock_notifier),
+        patch("packages.core.scheduler.get_webhook_notifier", return_value=mock_webhook),
+        patch("packages.core.scheduler.get_ai_advisor", return_value=mock_advisor),
+        patch("packages.core.scheduler.get_session") as mock_get_session,
+    ):
+        mock_get_session.return_value.__aenter__.return_value = AsyncMock()
+        mock_get_session.return_value.__aexit__.return_value = False
+        await scheduler._maybe_send_strategy_digest()
+
+    mock_advisor.analyze_strategy.assert_awaited_once()
+    mock_notifier.send_info.assert_awaited_once()
